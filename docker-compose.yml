@@ -1,0 +1,8 @@
+version: '3.8'
+services:
+  carma:
+    image: carma:latest
+    ports:
+      - "7100:7100"
+    environment:
+      TRUST_DOMAIN: cyberorbit
