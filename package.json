@@ -1,0 +1,14 @@
+{
+  "name": "carma",
+  "version": "0.1.0",
+  "description": "Context Addressable Reasoning and Memory Architecture - JSON-AM reference implementation",
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-strip-types server/index.ts"
+  },
+  "dependencies": {
+    "jose": "^5.0.0",
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "license": "Apache-2.0"
+}
