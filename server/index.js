@@ -4,6 +4,7 @@ import { verifyCapability } from './middleware/jwt.js';
 import { enforceCapability, validateEnvelope, sanitizeUri } from './middleware/guardrails.js';
 
 const PORT = process.env.PORT || 7100;
+const PUBLIC_KEY = process.env.PUBLIC_KEY || '';
 
 const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url || '', true);
@@ -17,16 +18,15 @@ const server = http.createServer(async (req, res) => {
       const uri = sanitizeUri(parsed.query.uri);
       const auth = req.headers.authorization || '';
       const token = auth.replace('Bearer ', '');
-      
-      // TODO: verify JWT and enforce capability
-      // const claims = await verifyCapability(token, publicKey);
-      // enforceCapability(claims, uri, 'read');
-      
+      if (!token) throw new Error('Missing token');
+      const claims = await verifyCapability(token, PUBLIC_KEY);
+      enforceCapability(claims, uri, 'read');
+      // TODO: fetch from adapter
       res.writeHead(200, {'Content-Type':'application/json'});
       res.end(JSON.stringify({id: uri, note: 'stub'}));
       return;
     } catch (e) {
-      res.writeHead(403); res.end('Forbidden');
+      res.writeHead(403); res.end('Forbidden: '+e.message);
       return;
     }
   }
