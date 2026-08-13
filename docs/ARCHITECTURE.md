@@ -1,21 +1,22 @@
 # Architecture
 
-CARMA = Context Addressable Reasoning and Memory Architecture
+## Components
+- API Gateway: /resolve, /memory, /capability
+- Security Layer: JWT verify, JWS verify
+- URI Resolver: parses scheme and trust domain
+- Link Engine: edge registry, graph traversal
+- Adapters: Postgres, Markdown, File
+- Federation Layer: ANS/DNS-AID
+
+## Data Flow
+1. Agent sends request with JWT
+2. Security verifies token
+3. Resolver routes to adapter
+4. Adapter fetches envelope
+5. Core signs response
+6. Return JWS envelope
 
 ## Trust Domains
-- trust://acme — internal Company AI
-  Capabilities: read + write + delegate
-  Data: signals, worldview, lessons, maxims
-
-- trust://customer-{org} — Orbit customer-facing AI
-  Capabilities: read + link only
-  Data: findings, reports, CVE, MITRE
-
-## Clients
-Primary client today: Claude via MCP
-Hermes agent is spec author, Company AI is internal orchestrator
-
-## Flow
-1. Claude requests memory://acme/sem/worldview with Bearer JWT
-2. CARMA verifies JWT, resolves via Postgres adapter
-3. Returns signed JWS envelope
+- acme internal
+- customer-*
+- public

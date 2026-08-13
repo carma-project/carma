@@ -1,21 +1,24 @@
 # Secret and Token Management
 
 ## JWT Capability Tokens
-- Issued by trust domain authority
-- Short lived: 15 min
-- Refresh via POST /capability
+- Issued via POST /capability with mTLS
+- Signed with EdDSA
+- Short lived: 15 min write, 60 min read
+- Refresh endpoint rate limited
 
 ## Signing Keys
-- Ed25519 key pairs per trust domain
-- Store in KMS / Vault
-- Rotate quarterly
+- Ed25519 key pair per trust domain
+- Private key stored in KMS/Vault, never in code
+- Public key published at /.well-known/jwks.json
+- Rotation every 90 days, overlap 30 days
 
 ## Environment Variables
-- DATABASE_URL
-- PRIVATE_KEY
-- PUBLIC_KEY
-- Never commit secrets
+- DATABASE_URL, PRIVATE_KEY, PUBLIC_KEY, JWT_ISSUER
+- Loaded from Railway variables or .env.local
+- Never commit .env files
 
-## Railway
-- Use Railway variables
-- Enable secret scanning
+## Key Rotation Procedure
+1. Generate new key pair
+2. Publish public key
+3. Dual sign for 30 days
+4. Retire old key
