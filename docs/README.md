@@ -6,7 +6,7 @@ CARMA is the reference implementation of JSON-AM for Context Addressable Reasoni
 ## Quick Start
 ```bash
 docker compose up --build
-curl http://localhost:7100/resolve?uri=memory://cyberorbit/sem/worldview
+curl http://localhost:7100/resolve?uri=memory://acme/sem/worldview
 ```
 
 ## Railway Deploy

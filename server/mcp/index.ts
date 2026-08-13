@@ -6,7 +6,7 @@ export class CARMAMCPServer {
 
   constructor() {
     this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: [{ uri: 'memory://cyberorbit/sem/*', name: 'CyberOrbit Memories' }]
+      resources: [{ uri: 'memory://acme/sem/*', name: 'acme Memories' }]
     }));
     this.server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
       return { contents: [{ uri: req.params.uri, text: JSON.stringify({}) }] };

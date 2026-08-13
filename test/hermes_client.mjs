@@ -12,5 +12,5 @@ async function resolve(uri) {
   console.log(JSON.stringify(data, null, 2));
 }
 
-const uri = process.argv[2] || 'memory://cyberorbit/sem/worldview';
+const uri = process.argv[2] || 'memory://acme/sem/worldview';
 resolve(uri);

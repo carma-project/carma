@@ -1,7 +1,7 @@
 # CARMA Rules
 
 ## Trust Domain Rules
-- trust://cyberorbit: read/write/delegate
+- trust://acme: read/write/delegate
 - trust://customer-{org}: read/link only
 - trust://public: no capability required
 

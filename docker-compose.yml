@@ -5,6 +5,6 @@ services:
     ports:
       - "7100:7100"
     environment:
-      TRUST_DOMAIN: cyberorbit
+      TRUST_DOMAIN: acme
       PORT: 7100
     restart: unless-stopped

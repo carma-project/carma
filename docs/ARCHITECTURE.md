@@ -3,7 +3,7 @@
 CARMA = Context Addressable Reasoning and Memory Architecture
 
 ## Trust Domains
-- trust://cyberorbit — internal Company AI
+- trust://acme — internal Company AI
   Capabilities: read + write + delegate
   Data: signals, worldview, lessons, maxims
 
@@ -16,6 +16,6 @@ Primary client today: Claude via MCP
 Hermes agent is spec author, Company AI is internal orchestrator
 
 ## Flow
-1. Claude requests memory://cyberorbit/sem/worldview with Bearer JWT
+1. Claude requests memory://acme/sem/worldview with Bearer JWT
 2. CARMA verifies JWT, resolves via Postgres adapter
 3. Returns signed JWS envelope
