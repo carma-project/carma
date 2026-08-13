@@ -1,0 +1,15 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+healthcheckPath = "/"
+restartPolicyType = "ON_FAILURE"
+
+[[services]]
+name = "carma"
+port = 7100
+envVars = [
+  {name = "PORT", value = "7100"},
+  {name = "TRUST_DOMAIN", value = "cyberorbit"},
+  {name = "DATABASE_URL", from = "POSTGRES_URL"}
+]
