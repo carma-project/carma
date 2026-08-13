@@ -2,14 +2,5 @@
 builder = "NIXPACKS"
 
 [deploy]
-healthcheckPath = "/"
+healthcheckPath = "/health"
 restartPolicyType = "ON_FAILURE"
-
-[[services]]
-name = "carma"
-port = 7100
-envVars = [
-  {name = "PORT", value = "7100"},
-  {name = "TRUST_DOMAIN", value = "acme"},
-  {name = "DATABASE_URL", from = "POSTGRES_URL"}
-]

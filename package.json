@@ -4,11 +4,12 @@
   "description": "Context Addressable Reasoning and Memory Architecture - JSON-AM reference implementation",
   "type": "module",
   "scripts": {
-    "start": "node --experimental-strip-types server/index.ts"
+    "start": "node server/index.js"
   },
   "dependencies": {
     "jose": "^5.0.0",
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "pg": "^8.11.0"
   },
   "license": "Apache-2.0"
 }

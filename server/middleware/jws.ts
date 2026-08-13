@@ -1,14 +1,16 @@
-import { SignJWT, jwtVerify } from 'jose';
+import { SignJWT, jwtVerify, createSecretKey } from 'jose';
 
-export async function signEnvelope(envelope: any, privateKey: Uint8Array) {
+export async function signEnvelope(envelope: any, secret: string) {
+  const key = createSecretKey(Buffer.from(secret, 'utf-8'));
   const jwt = await new SignJWT(envelope)
     .setProtectedHeader({ alg: 'EdDSA', kid: 'carma-key' })
     .setIssuedAt()
-    .sign(privateKey);
+    .sign(key);
   return jwt;
 }
 
-export async function verifyEnvelope(token: string, publicKey: Uint8Array) {
-  const { payload } = await jwtVerify(token, publicKey, { algorithms: ['EdDSA'] });
+export async function verifyEnvelope(token: string, secret: string) {
+  const key = createSecretKey(Buffer.from(secret, 'utf-8'));
+  const { payload } = await jwtVerify(token, key, { algorithms: ['EdDSA'] });
   return payload;
 }

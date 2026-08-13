@@ -1,9 +1,10 @@
 export function enforceCapability(tokenClaims: any, uri: string, action: string) {
-  const { domains, actions, resources } = tokenClaims.jsonam;
+  const { domains, actions, resources } = tokenClaims.jsonam || tokenClaims;
   if (!actions.includes(action)) throw new Error('Action not permitted');
-  // domain check
-  const domain = uri.split('://')[0];
-  if (!domains.includes(`trust://${domain}`)) throw new Error('Domain not permitted');
+  const parts = uri.split('://');
+  if (parts.length < 2) throw new Error('Invalid URI');
+  const trustDomain = parts[1].split('/')[0];
+  if (!domains.includes(`trust://${trustDomain}`)) throw new Error('Domain not permitted');
   return true;
 }
 
@@ -16,6 +17,6 @@ export function validateEnvelope(envelope: any) {
 
 export function sanitizeUri(uri: string) {
   if (!/^memory:|context:|trace:|agent:|trust:/.test(uri)) throw new Error('Invalid scheme');
-  if ('..' in uri) throw new Error('Path traversal');
+  if (uri.includes('..')) throw new Error('Path traversal');
   return uri;
 }
