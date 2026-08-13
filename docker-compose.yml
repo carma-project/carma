@@ -1,8 +1,10 @@
 version: '3.8'
 services:
   carma:
-    image: carma:latest
+    build: .
     ports:
       - "7100:7100"
     environment:
       TRUST_DOMAIN: cyberorbit
+      PORT: 7100
+    restart: unless-stopped
