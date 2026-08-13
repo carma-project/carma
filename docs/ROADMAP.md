@@ -1,6 +1,6 @@
 # CARMA Roadmap
 
-## Phase 1 - Prototype
+## Phase 1 - Prototype ✓
 - [x] Spec draft
 - [x] Basic server skeleton
 - [x] Docs
