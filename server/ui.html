@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CARMA — Configuration</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
+    --muted: #8b949e; --ok: #3fb950; --bad: #f85149; --warn: #d29922; --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; justify-content: center; padding: 40px 16px;
+  }
+  .wrap { width: 100%; max-width: 680px; }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: .3px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .overall {
+    display: flex; align-items: center; gap: 12px; padding: 16px 18px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--panel); margin-bottom: 20px;
+  }
+  .pill { font-weight: 600; font-size: 13px; padding: 4px 10px; border-radius: 999px; }
+  .pill.ready { background: rgba(63,185,80,.15); color: var(--ok); }
+  .pill.notready { background: rgba(248,81,73,.15); color: var(--bad); }
+  .overall .desc { color: var(--muted); font-size: 13px; }
+  ul.steps { list-style: none; margin: 0; padding: 0; }
+  li.step {
+    border: 1px solid var(--border); background: var(--panel); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 10px; display: flex; gap: 14px; align-items: flex-start;
+  }
+  .dot { width: 12px; height: 12px; border-radius: 50%; margin-top: 5px; flex: 0 0 auto; background: var(--muted); }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(63,185,80,.15); }
+  .dot.bad { background: var(--bad); box-shadow: 0 0 0 3px rgba(248,81,73,.15); }
+  .step .title { font-weight: 600; }
+  .step .state { font-size: 12px; margin-left: 8px; color: var(--muted); font-weight: 500; }
+  .step .hint { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  code { background: #010409; border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; font-size: 12.5px; }
+  .bar { display: flex; align-items: center; gap: 12px; margin-top: 22px; }
+  button {
+    background: var(--accent); color: #0d1117; border: 0; border-radius: 7px; padding: 8px 16px;
+    font-weight: 600; font-size: 14px; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.08); }
+  .meta { color: var(--muted); font-size: 12.5px; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 24px; border-top: 1px solid var(--border); padding-top: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>CARMA</h1>
+    <span class="meta">Configuration &amp; readiness</span>
+  </header>
+  <p class="sub">Confirm this deployment is wired up before serving <code>memory://</code> resolves.</p>
+
+  <div class="overall">
+    <span id="overallPill" class="pill notready">CHECKING…</span>
+    <span id="overallDesc" class="desc">Contacting <code>/api/status</code>…</span>
+  </div>
+
+  <ul class="steps" id="steps"></ul>
+
+  <div class="bar">
+    <button id="refresh">Refresh status</button>
+    <span class="meta" id="meta"></span>
+  </div>
+
+  <footer>
+    Only configuration <em>presence</em> is shown here — secret values (keys, connection
+    strings) are never exposed by this page or the <code>/api/status</code> API.
+  </footer>
+</div>
+
+<script>
+const STEPS = [
+  {
+    key: 'server', title: 'Server running',
+    ok: () => true,
+    okText: 'Listening', badText: '—',
+    hint: () => 'The HTTP server is up on port <code>' + (state.port ?? '?') + '</code>.'
+  },
+  {
+    key: 'publicKey', title: 'Capability key (PUBLIC_KEY)',
+    ok: s => s.publicKey.valid,
+    hint: s => s.publicKey.configured
+      ? 'PUBLIC_KEY is set but could not be parsed. It must be an <strong>Ed25519 SPKI PEM</strong>.'
+      : 'Set the <code>PUBLIC_KEY</code> env var to your Ed25519 SPKI public key (PEM). Required to verify capability tokens on <code>/resolve</code>.'
+  },
+  {
+    key: 'db', title: 'Database connection (DATABASE_URL)',
+    ok: s => s.database.connected,
+    hint: s => s.database.configured
+      ? ('Configured, but not reachable' + (s.database.error ? ': <code>' + esc(s.database.error) + '</code>' : '.'))
+      : 'Set the <code>DATABASE_URL</code> env var to your Postgres connection string.'
+  },
+  {
+    key: 'schema', title: 'Schema applied (agent_memory)',
+    ok: s => s.database.schemaReady,
+    hint: () => 'Apply <code>adapters/postgres-schema.sql</code> to create the <code>agent_memory</code> table.'
+  },
+];
+
+let state = {};
+function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function render() {
+  const ul = document.getElementById('steps');
+  ul.innerHTML = '';
+  for (const step of STEPS) {
+    const ok = !!step.ok(state);
+    // Always show the informational hint for "server"; for the rest, only when action is needed.
+    const showHint = step.key === 'server' || !ok;
+    const li = document.createElement('li');
+    li.className = 'step';
+    li.innerHTML =
+      '<span class="dot ' + (ok ? 'ok' : 'bad') + '"></span>' +
+      '<div><div class="title">' + step.title +
+      '<span class="state">' + (ok ? 'OK' : 'action needed') + '</span></div>' +
+      (showHint ? '<div class="hint">' + step.hint(state) + '</div>' : '') +
+      '</div>';
+    ul.appendChild(li);
+  }
+  const pill = document.getElementById('overallPill');
+  const desc = document.getElementById('overallDesc');
+  if (state.ready) {
+    pill.className = 'pill ready'; pill.textContent = 'READY';
+    desc.innerHTML = 'All checks passed — <code>/resolve</code> is ready to serve.';
+  } else {
+    pill.className = 'pill notready'; pill.textContent = 'NOT READY';
+    desc.innerHTML = 'Complete the highlighted step(s) below.';
+  }
+  document.getElementById('meta').innerHTML =
+    'trust domain: <code>' + (state.trustDomain ? esc(state.trustDomain) : 'unset') + '</code> · updated ' +
+    new Date().toLocaleTimeString();
+}
+
+async function load() {
+  try {
+    const res = await fetch('/api/status', { cache: 'no-store' });
+    state = await res.json();
+  } catch (e) {
+    state = { publicKey:{}, database:{}, ready:false, _err: String(e) };
+  }
+  render();
+}
+
+document.getElementById('refresh').addEventListener('click', load);
+load();
+</script>
+</body>
+</html>
