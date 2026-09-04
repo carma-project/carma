@@ -5,27 +5,45 @@ Guidance for coding agents working on CARMA (JSON-AM reference implementation).
 ## Running the app
 
 - Install deps: `npm install`
-- Start the dev server: `npm run dev` (runs `tsx server/index.js`), listens on port `7100`.
+- Dev server: `npm run dev` (runs `tsx server/index.js`), listens on port `7100`.
+- Production start: `npm start` (runs `node --import tsx server/index.js`).
 
-Use `npm run dev`, not `npm start`. The canonical entrypoint `server/index.js` imports
-its middleware/adapters with `.js` specifiers, but those files are TypeScript (`server/middleware/*.ts`).
-Plain `node server/index.js` fails with `ERR_MODULE_NOT_FOUND`; `tsx` resolves the `.js`
-specifiers to their `.ts` sources. `tsx` is a dev dependency.
+The entrypoint `server/index.js` imports its middleware/adapters with `.js` specifiers, but
+those files are TypeScript (`server/middleware/*.ts`, `adapters/*.ts`). Plain
+`node server/index.js` fails with `ERR_MODULE_NOT_FOUND`; `tsx` resolves the `.js` specifiers
+to their `.ts` sources. `tsx` is a runtime dependency (not dev-only) so it is present in
+production images.
+
+## Configuration
+
+`server/index.js` (the production entrypoint) does JWT auth + Postgres-backed resolution:
+
+- `PORT` — HTTP port (default `7100`).
+- `PUBLIC_KEY` — Ed25519 **SPKI PEM**. Imported at startup via `jose.importSPKI(..., 'EdDSA')`
+  and used to verify capability tokens. If unset/invalid, the process still boots and `/health`
+  works, but `/resolve` returns `403`.
+- `DATABASE_URL` — Postgres connection string. Apply `adapters/postgres-schema.sql` first.
 
 ## Testing
 
-This is a headless HTTP service — verify with terminal requests (no GUI). With the server
-running on `:7100`:
+Headless HTTP service — verify with terminal requests (no GUI). With the server on `:7100`:
 
 - `curl http://localhost:7100/health` -> `ok` (HTTP 200)
-- `curl "http://localhost:7100/resolve?uri=memory://acme/sem/example"` -> `403 Forbidden: Missing token`
-- `curl -H "Authorization: Bearer bad.token" "http://localhost:7100/resolve?uri=memory://acme/sem/example"` -> `403` (jose rejects)
+- No token -> `403 Forbidden: Missing token`
+- Invalid JWT -> `403` (jose rejects)
 - Disallowed scheme / path traversal in `uri` -> `403` (guardrails in `server/middleware/guardrails.ts`)
+- Valid Ed25519 capability token (`jsonam.domains`/`actions` matching the URI) + a matching row
+  in `agent_memory` -> `200` with the envelope; authorized-but-missing URI -> `404`.
 
-Known gap: a successful `200` from `/resolve` is not reachable through config alone, because
-`server/index.js` passes the raw `PUBLIC_KEY` env string directly to `jose`'s `jwtVerify`, but
-EdDSA requires a `KeyObject`/`CryptoKey`/JWK. Fixing the happy path requires an application
-code change (parse `PUBLIC_KEY` into a key object).
+The full stack (app + Postgres) runs locally via `docker compose up --build` after supplying
+`PUBLIC_KEY` (e.g. `PUBLIC_KEY="$(cat pub.pem)" docker compose up --build`).
+
+## Deployment
+
+- Container: `Dockerfile` (`node:20-alpine`, `npm ci --omit=dev`, `CMD node --import tsx server/index.js`).
+  A `.dockerignore` keeps `node_modules` and local secrets out of the image.
+- Railway uses Nixpacks (`railway.toml` -> `nixpacks.toml`), start `node --import tsx server/index.js`,
+  healthcheck `/health`. Provide `DATABASE_URL` and `PUBLIC_KEY` env vars and add a Postgres service.
 
 ## Cursor Cloud specific instructions
 
