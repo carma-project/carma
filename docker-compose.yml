@@ -1,10 +1,30 @@
-version: '3.8'
 services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: carma
+      POSTGRES_PASSWORD: carma
+      POSTGRES_DB: carma
+    volumes:
+      - ./adapters/postgres-schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U carma -d carma"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   carma:
     build: .
     ports:
       - "7100:7100"
     environment:
-      TRUST_DOMAIN: acme
       PORT: 7100
+      TRUST_DOMAIN: acme
+      DATABASE_URL: postgres://carma:carma@db:5432/carma
+      # Ed25519 SPKI public key (PEM). Required to verify capability tokens on
+      # /resolve. Provide via a .env file or your platform's secret manager.
+      PUBLIC_KEY: ${PUBLIC_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
