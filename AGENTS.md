@@ -24,11 +24,19 @@ production images.
   works, but `/resolve` returns `403`.
 - `DATABASE_URL` — Postgres connection string. Apply `adapters/postgres-schema.sql` first.
 
+## Endpoints
+
+- `GET /` (and `/ui`) — built-in, self-contained configuration/readiness UI (no external assets).
+- `GET /api/status` — JSON deploy diagnostics: `PUBLIC_KEY` validity, DB connectivity, and
+  `agent_memory` schema presence. Booleans only — never returns secret values.
+- `GET /health` — liveness. `GET /resolve?uri=...` — authenticated, Postgres-backed resolve.
+
 ## Testing
 
-Headless HTTP service — verify with terminal requests (no GUI). With the server on `:7100`:
+Verify with terminal requests. With the server on `:7100`:
 
 - `curl http://localhost:7100/health` -> `ok` (HTTP 200)
+- `curl http://localhost:7100/api/status` -> JSON; `"ready":true` once fully configured
 - No token -> `403 Forbidden: Missing token`
 - Invalid JWT -> `403` (jose rejects)
 - Disallowed scheme / path traversal in `uri` -> `403` (guardrails in `server/middleware/guardrails.ts`)
