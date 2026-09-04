@@ -2,11 +2,11 @@
     nixPkgs = ["nodejs_20"]
 
 [phases.install]
-    cmd = "npm install"
+    cmd = "npm ci"
 
 [phases.build]
     cmd = ""
 
 [start]
-    cmd = "node server/index.ts"
+    cmd = "node --import tsx server/index.js"
     port = 7100
