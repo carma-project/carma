@@ -4,6 +4,9 @@ import { generateKeyPair, exportPKCS8 } from 'jose';
 import { PostgresAdapter } from '../adapters/postgres.js';
 import { storeTrace, newTraceUri } from '../server/ingest.js';
 import { localEmbed, toVectorLiteral } from '../server/embedding.js';
+import { runDistillation } from '../server/distill/pipeline.js';
+import os from 'os';
+import { readFileSync } from 'fs';
 
 const DB = process.env.DATABASE_URL;
 
@@ -49,6 +52,60 @@ test(
       await adapter.audit({ actor: 'itest', action: 'read', uri: dbTrace, trustDomain: dom, result: 'allow', requestId: 'r-' + dom });
       const c = await adapter.query('SELECT count(*)::int AS n FROM audit_log WHERE request_id = $1', ['r-' + dom]);
       assert.equal(c.rows[0].n, 1);
+    } finally {
+      await adapter.close();
+    }
+  }
+);
+
+test(
+  'Distillation pipeline: traces -> dataset -> local fine-tune -> signed manifest',
+  { skip: DB ? false : 'DATABASE_URL not set' },
+  async () => {
+    const { privateKey } = await generateKeyPair('EdDSA', { crv: 'Ed25519', extractable: true });
+    const pkcs8 = await exportPKCS8(privateKey);
+    const adapter = new PostgresAdapter(DB);
+    try {
+      const dom = 'dtest-' + Date.now();
+      for (const [task, content] of [
+        ['scan host', 'ran nmap and found an unauthenticated redis on 6379'],
+        ['triage finding', 'unauth redis allows RCE via config set dir + module load'],
+        ['recommend fix', 'require AUTH, bind to localhost, and firewall port 6379'],
+      ]) {
+        await storeTrace(adapter, { uri: newTraceUri(dom), trustDomain: dom, subject: 'test', privateKeyPem: pkcs8 }, { task, content });
+      }
+
+      const outputDir = os.tmpdir() + '/carma-distill-e2e-' + Date.now();
+      const config = {
+        privateKeyPem: pkcs8,
+        finetuneProvider: 'local',
+        distillOutputDir: outputDir,
+        distillMaxExamples: 50000,
+        distillSystemPrompt: 'You are a penetration testing assistant.',
+        fireworksBaseModel: 'accounts/fireworks/models/llama-v3p1-8b-instruct',
+      };
+      const result = await runDistillation(adapter, config, { trustDomain: dom, kind: 'trace', subject: 'tester' });
+
+      assert.equal(result.examples, 3);
+      assert.equal(result.provider, 'local');
+      assert.equal(result.status, 'succeeded');
+      assert.ok(result.datasetUri.startsWith(`memory://${dom}/dataset/`));
+
+      // The manifest is a signed, resolvable JSON-AM envelope with provenance.
+      const row = await adapter.resolve(result.datasetUri);
+      assert.ok(row && row.envelope);
+      assert.equal(row.envelope.type, 'Dataset');
+      assert.ok(row.envelope.signature);
+      assert.equal(row.envelope.distillation.examples, 3);
+      assert.equal(row.envelope.provenance.sourceUris.length, 3);
+
+      // The dataset file the local provider wrote is valid chat JSONL.
+      const files = readFileSync(outputDir + '/' + result.jobId + '.jsonl', 'utf8').trim().split('\n');
+      assert.equal(files.length, 3);
+      const ex = JSON.parse(files[0]);
+      assert.equal(ex.messages[0].role, 'system');
+      assert.equal(ex.messages[1].role, 'user');
+      assert.equal(ex.messages[2].role, 'assistant');
     } finally {
       await adapter.close();
     }
