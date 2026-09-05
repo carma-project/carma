@@ -7,7 +7,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { verifyCapability } from './middleware/jwt.js';
 import { enforceCapability, sanitizeUri, enforceTokenLifetime } from './middleware/guardrails.js';
 import { embed, toVectorLiteral } from './embedding.js';
-import { storeTrace, newTraceUri } from './ingest.js';
+import { storeTrace, newTraceUri, recordOutcome, retractMemory } from './ingest.js';
+import { toPrecedent, weightsFromConfig } from './recall.js';
 import { runDistillation, fineTuneStatus } from './distill/pipeline.js';
 import { CARMAMCPServer } from './mcp/index.js';
 import { PostgresAdapter } from '../adapters/postgres.js';
@@ -187,6 +188,7 @@ async function handleMcp(req, res, requestId) {
     trustDomain: config.trustDomain,
     privateKeyPem: config.privateKeyPem,
     allowedActions: grant.actions,
+    recallWeights: weightsFromConfig(config),
   });
   await carma.server.connect(transport);
   return transport.handleRequest(req, res);
@@ -205,7 +207,48 @@ function validateTraceInput(body) {
   if (!Array.isArray(boundContext)) throw new Error('boundContext must be an array');
   if (boundContext.length > config.boundContextMax) throw new Error('boundContext too large');
   if (!boundContext.every((x) => typeof x === 'string')) throw new Error('boundContext must be strings');
-  return { task, content, boundContext };
+
+  let decision = null;
+  if (body.decision != null) {
+    if (typeof body.decision !== 'object' || typeof body.decision.choice !== 'string') {
+      throw new Error('decision must be an object with a string choice');
+    }
+    if (body.decision.alternatives != null && !Array.isArray(body.decision.alternatives)) {
+      throw new Error('decision.alternatives must be an array');
+    }
+    decision = { choice: body.decision.choice, ...(body.decision.alternatives ? { alternatives: body.decision.alternatives } : {}) };
+  }
+
+  let outcome = null;
+  if (body.outcome != null) {
+    outcome = validateOutcome(body.outcome);
+  }
+
+  const confidence = numInRange(body.confidence, 'confidence', 0, 1);
+  const importance = numInRange(body.importance, 'importance', 0, 1);
+
+  let supersedes = null;
+  if (body.supersedes != null) supersedes = sanitizeUri(body.supersedes);
+
+  return { task, content, boundContext, decision, outcome, confidence, importance, supersedes };
+}
+
+const OUTCOME_STATUSES = ['pending', 'success', 'failure', 'mixed', 'unknown'];
+
+function numInRange(v, name, lo, hi) {
+  if (v == null) return null;
+  if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`${name} must be a number`);
+  if (v < lo || v > hi) throw new Error(`${name} must be in [${lo}, ${hi}]`);
+  return v;
+}
+
+function validateOutcome(o) {
+  if (typeof o !== 'object') throw new Error('outcome must be an object');
+  if (!OUTCOME_STATUSES.includes(o.status)) throw new Error(`outcome.status must be one of ${OUTCOME_STATUSES.join(', ')}`);
+  const score = numInRange(o.score, 'outcome.score', -1, 1);
+  if (o.evidence != null && typeof o.evidence !== 'string') throw new Error('outcome.evidence must be a string');
+  if ((o.evidence || '').length > config.contentMaxLength) throw new Error('outcome.evidence exceeds limit');
+  return { status: o.status, ...(score != null ? { score } : {}), ...(o.evidence ? { evidence: o.evidence } : {}) };
 }
 
 // ---------- server ----------
@@ -348,7 +391,7 @@ const server = http.createServer(async (req, res) => {
           { uri, trustDomain, subject: claims.sub, privateKeyPem: config.privateKeyPem },
           input
         );
-        audit.record({ actor: claims.sub, action: 'write', uri, trustDomain, result: 'allow', requestId });
+        audit.record({ actor: claims.sub, action: 'write', uri, trustDomain, result: 'allow', requestId, detail: input.supersedes ? { supersedes: input.supersedes } : undefined });
         return sendJson(res, 201, result);
       } catch (e) {
         logger.error('ingest_error', { requestId, error: e.message });
@@ -372,12 +415,88 @@ const server = http.createServer(async (req, res) => {
       }
       try {
         const embedding = toVectorLiteral(await embed(String(q)));
-        const results = await adapter.search({ embedding, k, trustDomain: domain || null });
+        const rows = await adapter.search({ embedding, k, trustDomain: domain || null, weights: weightsFromConfig(config) });
+        const results = rows.map(toPrecedent);
         audit.record({ actor: claims.sub, action: 'search', trustDomain: domain, result: 'allow', requestId, detail: { q: String(q), k, hits: results.length } });
         return sendJson(res, 200, { query: q, count: results.length, results });
       } catch (e) {
         logger.error('search_error', { requestId, error: e.message });
         return sendJson(res, 500, { error: 'Internal error' });
+      }
+    }
+
+    // Record how a prior decision turned out (write capability). Feeds recall's
+    // outcome weighting so reasoning that worked resurfaces.
+    if (path === '/outcome' && req.method === 'POST') {
+      if (rateLimited(req, res, requestId)) return;
+      let body;
+      try {
+        body = await readJsonBody(req, config.bodyLimitBytes);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      let decisionUri;
+      let outcome;
+      try {
+        decisionUri = sanitizeUri(body.decisionUri);
+        // Flat contract: { decisionUri, status, score?, evidence? } (matches the MCP tool).
+        outcome = validateOutcome({ status: body.status, score: body.score, evidence: body.evidence });
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      const trustDomain = domainOf(decisionUri) || config.trustDomain;
+      let claims;
+      try {
+        claims = await authorize(req, decisionUri, 'write');
+      } catch (e) {
+        audit.record({ action: 'outcome', uri: decisionUri, trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const result = await recordOutcome(
+          adapter,
+          { trustDomain, subject: claims.sub, privateKeyPem: config.privateKeyPem },
+          { decisionUri, status: outcome.status, score: outcome.score, evidence: outcome.evidence }
+        );
+        audit.record({ actor: claims.sub, action: 'outcome', uri: decisionUri, trustDomain, result: 'allow', requestId, detail: { status: outcome.status, outcomeUri: result.outcomeUri } });
+        return sendJson(res, 201, result);
+      } catch (e) {
+        logger.error('outcome_error', { requestId, error: e.message });
+        audit.record({ actor: claims.sub, action: 'outcome', uri: decisionUri, trustDomain, result: 'error', requestId, detail: { error: e.message } });
+        return sendJson(res, 400, { error: e.message });
+      }
+    }
+
+    // Retract a memory: excluded from recall, preserved for audit (write cap).
+    if (path === '/retract' && req.method === 'POST') {
+      if (rateLimited(req, res, requestId)) return;
+      let body;
+      try {
+        body = await readJsonBody(req, config.bodyLimitBytes);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      let uri;
+      try {
+        uri = sanitizeUri(body.uri);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      const trustDomain = domainOf(uri) || config.trustDomain;
+      let claims;
+      try {
+        claims = await authorize(req, uri, 'write');
+      } catch (e) {
+        audit.record({ action: 'retract', uri, trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const result = await retractMemory(adapter, { trustDomain }, uri);
+        audit.record({ actor: claims.sub, action: 'retract', uri, trustDomain, result: 'allow', requestId, detail: { reason: body.reason ?? null } });
+        return sendJson(res, 200, result);
+      } catch (e) {
+        logger.error('retract_error', { requestId, error: e.message });
+        return sendJson(res, 400, { error: e.message });
       }
     }
 

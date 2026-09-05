@@ -7,6 +7,11 @@ function toInt(value, def) {
   return Number.isFinite(n) ? Math.trunc(n) : def;
 }
 
+function toFloat(value, def) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : def;
+}
+
 function toBool(value, def = false) {
   if (value === undefined || value === '') return def;
   return /^(1|true|yes|on)$/i.test(String(value));
@@ -37,6 +42,12 @@ export function parseConfig(env = {}) {
     contentMaxLength: toInt(env.CONTENT_MAX_LENGTH, 100_000),
     boundContextMax: toInt(env.BOUND_CONTEXT_MAX, 256),
     searchKMax: toInt(env.SEARCH_K_MAX, 50),
+    // Precedent recall ranking: blend of semantic similarity, outcome signal
+    // (prefer reasoning that worked), and recency decay. See adapters/postgres.ts.
+    recallWSim: toFloat(env.RECALL_W_SIM, 1.0),
+    recallWOutcome: toFloat(env.RECALL_W_OUTCOME, 0.4),
+    recallWRecency: toFloat(env.RECALL_W_RECENCY, 0.15),
+    recallHalfLifeDays: toFloat(env.RECALL_HALF_LIFE_DAYS, 30),
     // Distillation / fine-tuning
     finetuneProvider: (env.FINETUNE_PROVIDER || 'local').toLowerCase(),
     fireworksApiKey: env.FIREWORKS_API_KEY || '',
@@ -97,6 +108,7 @@ export function redactedSummary(cfg) {
     embedDim: cfg.embedDim,
     finetuneProvider: cfg.finetuneProvider,
     mcpHttp: cfg.mcpHttpEnabled ? cfg.mcpHttpPath : false,
+    recall: { sim: cfg.recallWSim, outcome: cfg.recallWOutcome, recency: cfg.recallWRecency, halfLifeDays: cfg.recallHalfLifeDays },
     tokenMaxAgeRead: cfg.tokenMaxAgeRead,
     tokenMaxAgeWrite: cfg.tokenMaxAgeWrite,
     rateLimit: cfg.rateLimitEnabled ? { rps: cfg.rateLimitRps, burst: cfg.rateLimitBurst } : false,

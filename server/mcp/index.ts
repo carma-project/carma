@@ -5,8 +5,9 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { storeTrace, newTraceUri } from '../ingest.js';
+import { storeTrace, newTraceUri, recordOutcome, retractMemory } from '../ingest.js';
 import { embed, toVectorLiteral } from '../embedding.js';
+import { toPrecedent } from '../recall.js';
 
 export interface MCPConfig {
   trustDomain: string;
@@ -16,6 +17,9 @@ export interface MCPConfig {
   // is derived from the caller's capability token so the same governance model
   // applies across transports.
   allowedActions?: string[];
+  // Optional precedent-recall weights (see adapters/postgres.ts). Defaults apply
+  // when omitted.
+  recallWeights?: { sim?: number; outcome?: number; recency?: number; halfLifeDays?: number };
 }
 
 // MCP server exposing CARMA to agents over any MCP transport (stdio for local
@@ -68,25 +72,77 @@ export class CARMAMCPServer {
         {
           name: 'store_trace',
           description:
-            'Store a reasoning trace as a signed JSON-AM trace:// envelope and index it in the RAG store. Returns the memory pointer (URI).',
+            'Store a reasoning trace for one decision as a signed JSON-AM trace:// envelope and index it for recall. ' +
+            'Optionally record the decision made, an initial outcome, salience hints, and a supersedes link (revision). Returns the memory pointer (URI).',
           inputSchema: {
             type: 'object',
             properties: {
-              task: { type: 'string', description: 'The task or goal the trace addresses.' },
+              task: { type: 'string', description: 'The task/situation the decision addresses.' },
               content: { type: 'string', description: 'The reasoning trace text.' },
               boundContext: {
                 type: 'array',
                 items: { type: 'string' },
-                description: 'URIs of context/memories this trace was bound to.',
+                description: 'URIs of context/memories (precedents) this reasoning was bound to.',
               },
+              decision: {
+                type: 'object',
+                description: 'The choice committed to and alternatives weighed.',
+                properties: {
+                  choice: { type: 'string' },
+                  alternatives: { type: 'array', items: { type: 'string' } },
+                },
+                required: ['choice'],
+              },
+              outcome: {
+                type: 'object',
+                description: 'Initial outcome if already known (usually recorded later via record_outcome).',
+                properties: {
+                  status: { type: 'string', enum: ['pending', 'success', 'failure', 'mixed', 'unknown'] },
+                  score: { type: 'number', description: 'Signed usefulness in [-1, 1].' },
+                  evidence: { type: 'string' },
+                },
+                required: ['status'],
+              },
+              confidence: { type: 'number', description: 'Model self-assessed confidence in [0, 1].' },
+              importance: { type: 'number', description: 'Salience hint in [0, 1].' },
+              supersedes: { type: 'string', description: 'URI of a prior memory this revision replaces.' },
             },
             required: ['content'],
           },
         },
         {
+          name: 'record_outcome',
+          description:
+            'Record how a prior decision turned out. Persists a signed Outcome envelope and updates recall weighting so reasoning that worked resurfaces.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              decisionUri: { type: 'string', description: 'URI of the decision/trace this outcome is for.' },
+              status: { type: 'string', enum: ['pending', 'success', 'failure', 'mixed', 'unknown'] },
+              score: { type: 'number', description: 'Signed usefulness in [-1, 1].' },
+              evidence: { type: 'string', description: 'What was observed.' },
+            },
+            required: ['decisionUri', 'status'],
+          },
+        },
+        {
+          name: 'retract_memory',
+          description:
+            'Retract a memory (e.g. found to be wrong). Excluded from future recall but preserved for audit and lineage.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              uri: { type: 'string', description: 'URI of the memory to retract.' },
+              reason: { type: 'string' },
+            },
+            required: ['uri'],
+          },
+        },
+        {
           name: 'search_memory',
           description:
-            'Semantic search over stored memories/traces. Returns JSON-AM pointers (URIs) ranked by similarity.',
+            'Precedent recall over stored decisions/memories. Returns precedents (reasoning, the decision made, how it turned out, and lineage) ' +
+            'ranked by a blend of semantic similarity, outcome signal, and recency. Superseded/retracted memories are excluded.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -117,8 +173,41 @@ export class CARMAMCPServer {
             subject: 'mcp',
             privateKeyPem: this.config.privateKeyPem,
           },
-          args
+          {
+            task: args.task,
+            content: args.content,
+            boundContext: args.boundContext,
+            decision: args.decision,
+            outcome: args.outcome,
+            confidence: args.confidence,
+            importance: args.importance,
+            supersedes: args.supersedes,
+          }
         );
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+      }
+      if (name === 'record_outcome') {
+        if (!this.allows('write')) {
+          return {
+            content: [{ type: 'text', text: "Permission denied: capability lacks 'write' action" }],
+            isError: true,
+          };
+        }
+        const result = await recordOutcome(
+          this.adapter,
+          { trustDomain: this.config.trustDomain, subject: 'mcp', privateKeyPem: this.config.privateKeyPem },
+          { decisionUri: String(args.decisionUri), status: args.status, score: args.score, evidence: args.evidence }
+        );
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+      }
+      if (name === 'retract_memory') {
+        if (!this.allows('write')) {
+          return {
+            content: [{ type: 'text', text: "Permission denied: capability lacks 'write' action" }],
+            isError: true,
+          };
+        }
+        const result = await retractMemory(this.adapter, { trustDomain: this.config.trustDomain }, String(args.uri));
         return { content: [{ type: 'text', text: JSON.stringify(result) }] };
       }
       if (name === 'search_memory') {
@@ -129,11 +218,13 @@ export class CARMAMCPServer {
           };
         }
         const embedding = toVectorLiteral(await embed(String(args.query ?? '')));
-        const results = await this.adapter.search({
+        const rows = await this.adapter.search({
           embedding,
           k: args.k ?? 5,
           trustDomain: this.config.trustDomain,
+          weights: this.config.recallWeights,
         });
+        const results = rows.map(toPrecedent);
         return {
           content: [{ type: 'text', text: JSON.stringify({ query: args.query, results }) }],
         };

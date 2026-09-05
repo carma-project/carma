@@ -7,8 +7,25 @@ export interface MemoryRecord {
   envelope: any;
   signature: string;
   content: string;
-  embedding: string; // pgvector literal, e.g. "[0.1,0.2,...]"
+  embedding: string | null; // pgvector literal, e.g. "[0.1,0.2,...]"; null = not recall-indexed
+  status?: string;
+  supersedes?: string | null;
+  outcomeStatus?: string | null;
+  outcomeScore?: number | null;
+  confidence?: number | null;
+  importance?: number | null;
 }
+
+// Recall ranking weights. Blends semantic similarity with an outcome signal
+// (prefer reasoning that worked) and recency decay — closer to human recall
+// than raw cosine distance.
+export interface RecallWeights {
+  sim?: number;
+  outcome?: number;
+  recency?: number;
+  halfLifeDays?: number;
+}
+const DEFAULT_WEIGHTS: Required<RecallWeights> = { sim: 1.0, outcome: 0.4, recency: 0.15, halfLifeDays: 30 };
 
 export interface PoolOptions {
   ssl?: any;
@@ -66,15 +83,23 @@ export class PostgresAdapter {
 
   async store(rec: MemoryRecord) {
     const query = `
-      INSERT INTO agent_memory (uri, kind, trust_domain, envelope, signature, content, embedding)
-      VALUES ($1, $2, $3, $4, $5, $6, $7::vector)
+      INSERT INTO agent_memory
+        (uri, kind, trust_domain, envelope, signature, content, embedding,
+         status, supersedes, outcome_status, outcome_score, confidence, importance)
+      VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10, $11, $12, $13)
       ON CONFLICT (uri) DO UPDATE SET
         kind = EXCLUDED.kind,
         trust_domain = EXCLUDED.trust_domain,
         envelope = EXCLUDED.envelope,
         signature = EXCLUDED.signature,
         content = EXCLUDED.content,
-        embedding = EXCLUDED.embedding
+        embedding = EXCLUDED.embedding,
+        status = EXCLUDED.status,
+        supersedes = EXCLUDED.supersedes,
+        outcome_status = EXCLUDED.outcome_status,
+        outcome_score = EXCLUDED.outcome_score,
+        confidence = EXCLUDED.confidence,
+        importance = EXCLUDED.importance
       RETURNING uri`;
     const res = await this.pool.query(query, [
       rec.uri,
@@ -84,14 +109,62 @@ export class PostgresAdapter {
       rec.signature,
       rec.content,
       rec.embedding,
+      rec.status ?? 'active',
+      rec.supersedes ?? null,
+      rec.outcomeStatus ?? null,
+      rec.outcomeScore ?? null,
+      rec.confidence ?? null,
+      rec.importance ?? null,
     ]);
     return res.rows[0];
   }
 
-  // Semantic retrieval: returns JSON-AM pointers ranked by cosine similarity.
-  async search(opts: { embedding: string; k?: number; trustDomain?: string | null; kind?: string | null }) {
+  // Mark a prior memory as superseded by a newer revision (recall returns head).
+  async markSuperseded(oldUri: string, newUri: string, trustDomain?: string | null) {
+    const params: any[] = [newUri, oldUri];
+    let extra = '';
+    if (trustDomain) {
+      params.push(trustDomain);
+      extra = ` AND trust_domain = $${params.length}`;
+    }
+    await this.pool.query(
+      `UPDATE agent_memory SET status = 'superseded', superseded_by = $1 WHERE uri = $2${extra}`,
+      params
+    );
+  }
+
+  // Update a decision row's denormalized outcome columns (used by recall).
+  async attachOutcome(
+    decisionUri: string,
+    o: { outcomeStatus: string | null; outcomeScore: number | null; outcomeUri: string | null }
+  ) {
+    await this.pool.query(
+      `UPDATE agent_memory SET outcome_status = $1, outcome_score = $2, outcome_uri = $3 WHERE uri = $4`,
+      [o.outcomeStatus, o.outcomeScore, o.outcomeUri, decisionUri]
+    );
+  }
+
+  async setStatus(uri: string, status: string) {
+    await this.pool.query(`UPDATE agent_memory SET status = $1 WHERE uri = $2`, [status, uri]);
+  }
+
+  // Precedent recall: retrieve active memories ranked by a blend of semantic
+  // similarity, outcome signal (prefer reasoning that worked), and recency.
+  // Returns the envelope + outcome/lineage so callers get the reasoning behind
+  // the decision and how it turned out — not just a pointer. Superseded and
+  // retracted memories are excluded (set includeInactive to override).
+  async search(opts: {
+    embedding: string;
+    k?: number;
+    trustDomain?: string | null;
+    kind?: string | null;
+    weights?: RecallWeights;
+    includeInactive?: boolean;
+  }) {
+    const w = { ...DEFAULT_WEIGHTS, ...(opts.weights || {}) };
     const params: any[] = [opts.embedding];
     let where = 'embedding IS NOT NULL';
+    if (!opts.includeInactive) where += " AND status = 'active'";
     if (opts.trustDomain) {
       params.push(opts.trustDomain);
       where += ` AND trust_domain = $${params.length}`;
@@ -100,13 +173,32 @@ export class PostgresAdapter {
       params.push(opts.kind);
       where += ` AND kind = $${params.length}`;
     }
+    params.push(w.sim);
+    const pSim = params.length;
+    params.push(w.outcome);
+    const pOut = params.length;
+    params.push(w.recency);
+    const pRec = params.length;
+    params.push(Math.max(1, w.halfLifeDays) * 86400);
+    const pHalf = params.length;
     params.push(opts.k ?? 5);
+    const pK = params.length;
+
+    const simExpr = `(1 - (embedding <=> $1::vector))`;
+    // Neutral (0) when no outcome is known, so undecided memories aren't penalized.
+    const outExpr = `COALESCE(outcome_score, CASE outcome_status WHEN 'success' THEN 1 WHEN 'failure' THEN -1 WHEN 'mixed' THEN 0 ELSE 0 END, 0)`;
+    const recExpr = `EXP(- EXTRACT(EPOCH FROM (now() - created_at)) / $${pHalf})`;
+    const scoreExpr = `($${pSim} * ${simExpr} + $${pOut} * (${outExpr}) + $${pRec} * ${recExpr})`;
+
     const query = `
-      SELECT uri, kind, trust_domain, 1 - (embedding <=> $1::vector) AS score
+      SELECT uri, kind, trust_domain, envelope, status, supersedes, superseded_by,
+             outcome_status, outcome_score, created_at,
+             ${simExpr} AS similarity,
+             ${scoreExpr} AS score
       FROM agent_memory
       WHERE ${where}
-      ORDER BY embedding <=> $1::vector
-      LIMIT $${params.length}`;
+      ORDER BY score DESC
+      LIMIT $${pK}`;
     const res = await this.pool.query(query, params);
     return res.rows;
   }
