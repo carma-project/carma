@@ -71,24 +71,33 @@
       count feeds recall + tier promotion; `working`→`consolidated`→`pinned`
       tiers; `POST /pin`, `GET /reviews`, `POST /reviews/resolve`
       (`adapters/postgres.ts`, `server/ingest.ts`, migration `0005`).
-- [ ] "Dreaming" — offline consolidation job (`npm run dream` / `POST /consolidate`):
-      decay/evict stale `working` memories, batch near-duplicate clustering into the
-      review queue, recompute salience/tier from outcomes.
-- [ ] Episodic→semantic distillation — condense recurring precedents into
-      reusable principles; outcome-weighted dataset selection for fine-tuning.
+- [x] "Dreaming" — offline consolidation job (`npm run dream` / `POST /consolidate`,
+      `server/consolidate/dream.ts`): decay/evict stale `working` memories (→ `archived`),
+      recompute salience/tier from outcomes, batch near-duplicate clustering into the
+      review queue **with a model-proposed resolution**, and episodic→semantic abstraction
+      of recurring decisions into signed, recall-indexed `Semantic` memories. `dryRun`
+      supported. Reasoning via the pluggable, provider-neutral memory model
+      (`server/memory/model.ts`; `local` default, `fireworks` optional).
+- [x] Episodic→semantic abstraction — recurring precedents on a task condense into a
+      reusable principle (`Semantic` envelope, migration additive) that feeds distillation
+      (selectable as `kind=semantic`).
+- [ ] Outcome-weighted dataset selection for fine-tuning — prefer success/pinned/reinforced,
+      exclude retracted/superseded/failure when building the training corpus.
+- [ ] LLM-assisted resolution is currently *proposal-only*; auto-apply high-confidence NOOP/UPDATE
+      merges behind a policy flag (still human-reversible) is future work.
 - [ ] Governed cross-domain (federated) recall.
 
 ## Phase 2.9 - Consolidation research (Mem0, arXiv:2504.19413) — planned
 Informed by "Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory".
-- [ ] LLM-assisted consolidation proposal — when a near-duplicate is detected, have the
-      configured (provider-neutral) model classify the operation (ADD / UPDATE / DELETE /
-      NOOP, per Mem0 §2.1) and pre-fill the human review recommendation. Human still decides;
-      CARMA keeps append-only + supersede (Mem0^g's "mark invalid, don't delete") for temporal
-      reasoning rather than physical deletion.
-- [ ] Extraction / gisting — condense verbose episodic traces into concise semantic
-      memories for cheap recall (Mem0 stores ~7k tokens/conversation vs ~26k full-context;
-      ~90% token + ~91% p95 latency savings). Recall a gist, resolve the full envelope on demand.
-      This is the mechanism behind episodic→semantic distillation above.
+- [x] LLM-assisted consolidation proposal — the dream dedup pass runs the configured
+      (provider-neutral) memory model to classify each near-duplicate (merge / keep_separate /
+      reject, mapping Mem0's ADD/UPDATE/DELETE/NOOP) and pre-fills the human review recommendation
+      (`proposed_resolution`/`proposed_reason`, migration `0006`). Human still decides; CARMA keeps
+      append-only + supersede (Mem0^g's "mark invalid, don't delete") rather than physical deletion.
+- [x] Extraction / gisting (episodic→semantic) — the dream abstract pass condenses recurring
+      decisions on a task into a concise `Semantic` principle for cheap recall (recall the gist,
+      resolve full envelopes on demand). Local extractive summarizer by default; hosted chat model
+      optional. Next: gist single verbose traces too, and a compact recall mode that returns gists.
 - [ ] Async summary refresh — background per-domain summary that provides global context to
       extraction/consolidation without blocking the write path (Mem0's async summary module).
 - [ ] Optional relationship/graph layer — evolve `boundContext`/`lineage` into a

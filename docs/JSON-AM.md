@@ -40,11 +40,12 @@ Added to the reasoning-trace envelope (`type: "ATIR"`), all optional:
 | `importance` | number `[0,1]` | Salience hint for consolidation. |
 | `status` | `active\|superseded\|retracted\|candidate` | Lifecycle; recall returns `active` only. |
 
-New envelope type:
+New envelope types:
 
 | Type | Fields | Purpose |
 | --- | --- | --- |
 | `Outcome` | `decisionUri`, `outcome` | A first-class, signed, addressable record that a prior decision produced an outcome. Kept separate so signed decision envelopes stay immutable. |
+| `Semantic` | `task`, `content`, `semantic{ principle, derivedFrom[], supportCount, successRate?, model? }` | A distilled, reusable principle abstracted from several concrete decisions on the same task during offline consolidation ("dreaming"). Episodic memory promoted to semantic memory: signed, recall-indexed, and linked back (`derivedFrom`) to the decisions it generalizes. Feeds distillation (selectable as `kind=semantic`). |
 
 ## Why outcomes are separate envelopes
 

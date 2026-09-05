@@ -12,6 +12,8 @@ Guidance for coding agents working on CARMA (JSON-AM reference implementation).
 - Mint a capability token: `npm run mint-token -- --domains trust://acme --actions read,write`.
 - Distill -> fine-tune: `npm run distill -- --domain acme --kind trace --base-model <model>`
   (provider via `FINETUNE_PROVIDER`; `local` default, `fireworks` for hosted SFT).
+- Consolidate ("dream"): `npm run dream -- --domain acme [--dry-run] [--steps decay,promote,dedup,abstract]`
+  (offline batch memory maintenance; memory model via `MEMORY_MODEL_PROVIDER`, `local` default).
 - Tests: `npm test` (unit always; integration + MCP tests run only when `DATABASE_URL` is set).
 
 The entrypoint `server/index.js` imports its middleware/adapters with `.js` specifiers, but
@@ -58,6 +60,15 @@ Production/hardening:
   above which a new memory is admitted directly to the `consolidated` tier (else `working`).
 - `REINFORCE_PROMOTE_AT` (`3`) — reinforcement count at which a `working` memory auto-promotes to
   `consolidated`.
+- `DREAM_DECAY_DAYS` (`30`) / `DREAM_MIN_REINFORCE_KEEP` (`1`) — offline consolidation: a `working`
+  memory older than the decay window with fewer reinforcements and no recorded success is archived.
+- `DREAM_SIM_THRESHOLD` (`0.92`) / `DREAM_MIN_CLUSTER_SIZE` (`3`) — batch near-duplicate similarity
+  for the dedup pass, and minimum decisions on one task before it is abstracted into a semantic memory.
+- `DREAM_MAX_REVIEWS` (`100`) / `DREAM_MAX_ABSTRACTIONS` (`50`) — per-run caps so a dream pass is bounded.
+- `MEMORY_MODEL_PROVIDER` (`local` default | `fireworks`) / `MEMORY_MODEL_NAME` — the pluggable model
+  used for consolidation reasoning (near-duplicate proposals + episodic→semantic gisting). `local` is
+  deterministic and offline; `fireworks` uses an OpenAI-compatible chat endpoint and falls back to
+  local on any error. Provider-neutral — bring any backend.
 - `LOG_LEVEL` (`info`) — structured JSON logs; each request gets an `X-Request-Id`.
 - `HSTS_ENABLED` (`false`) — send HSTS (enable when TLS terminates at/after the proxy).
 - `STRICT_BOOT` (`false`) — fail fast at startup if `PUBLIC_KEY`/`PRIVATE_KEY`/`DATABASE_URL`
@@ -90,6 +101,11 @@ Production/hardening:
 - `POST /reviews/resolve` — resolve a review (write). Body: `{ reviewId, resolution }` where
   `resolution` is `merge` (reinforce the kept memory), `keep_separate` (both stay), or `reject`
   (retract the candidate).
+- `POST /consolidate` — run offline consolidation ("dreaming") for a domain (write). Body:
+  `{ trustDomain?, steps?, dryRun?, limit? }` where `steps` ⊆ `["decay","promote","dedup","abstract"]`.
+  Returns a report: memories archived (decay), promoted (tier recompute), near-duplicate reviews
+  raised (each with a model-proposed resolution), and semantic memories abstracted. `dryRun:true`
+  reports intended changes without mutating.
 - `POST /distill` — distill stored reasoning/memory into a fine-tune job (capability action
   `distill`). Body: `{ trustDomain?, kind?, since?, limit?, format?, baseModel?, suffix? }`.
   Returns `{ datasetUri, examples, provider, baseModel, jobId, status, model }`.
@@ -177,10 +193,16 @@ Modeled on how human memory keeps salient material and lets the rest fade. Colum
   use and decaying when unused.
 - **Recall weighting**: `PostgresAdapter.search` blends similarity × outcome × recency × reinforce ×
   pinned-boost, and filters out `superseded`/`retracted` memories.
-- **"Dreaming" (planned)**: an offline batch counterpart to on-write consolidation — decay/evict
-  stale `working` memories, cluster near-duplicates into the review queue, recompute salience from
-  outcomes, and abstract recurring episodic decisions into semantic memories (feeds distillation).
-  Tracked in `docs/ROADMAP.md`.
+- **"Dreaming" (offline consolidation)**: `runDream` (`server/consolidate/dream.ts`, via
+  `npm run dream` / `POST /consolidate`) is the batch counterpart to on-write consolidation. Four
+  idempotent passes over a domain's active memory: (1) **decay** — archive stale, unproven,
+  unreinforced `working` memories (excluded from recall, kept for audit); (2) **promote** — recompute
+  tiers, moving proven (`success`) or recurring memories `working`→`consolidated`; (3) **dedup** —
+  batch near-duplicate detection into the review queue, each with a **model-proposed** resolution;
+  (4) **abstract** — condense recurring decisions on one task into a signed, recall-indexed
+  `Semantic` memory (episodic→semantic) that also feeds distillation. `dryRun` reports without
+  mutating. The reasoning (proposals + gisting) uses the pluggable, provider-neutral memory model
+  (`server/memory/model.ts`); `local` is deterministic/offline.
 
 ## Cursor Cloud specific instructions
 
