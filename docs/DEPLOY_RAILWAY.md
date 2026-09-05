@@ -33,8 +33,12 @@ Keep the private key secret. You can rotate later by re-issuing tokens.
 
 ## 3. Create the CARMA service
 
-Deploy this repo (Railway uses `railway.toml` → Nixpacks). Set variables on the CARMA
-service:
+Deploy this repo. `railway.toml` sets `builder = "DOCKERFILE"`, so Railway builds the
+container from the repo `Dockerfile` (whose `CMD` runs `migrate && start`). To deploy a
+**prebuilt image** instead, use Railway's *Deploy from Docker Image* — that path ignores
+`railway.toml`'s builder; just set the healthcheck path to `/health` in the service settings.
+
+Set variables on the CARMA service:
 
 | Variable | Value | Notes |
 | --- | --- | --- |

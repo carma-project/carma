@@ -156,9 +156,10 @@ The full stack (app + pgvector Postgres, migrations auto-applied) runs locally v
   A `.dockerignore` keeps `node_modules` and local secrets out of the image.
 - `docker-compose.yml` uses `pgvector/pgvector:pg16` and mounts `adapters/migrations` into
   the DB init dir, so a fresh volume is migrated automatically.
-- Railway uses Nixpacks (`railway.toml` -> `nixpacks.toml`). The start command runs
-  `node adapters/migrate.mjs && node --import tsx server/index.js`, so migrations apply on boot
-  (idempotent + advisory-locked); healthcheck `/health`. Provide `DATABASE_URL`, `PUBLIC_KEY`,
+- Railway builds the `Dockerfile` (`railway.toml` sets `builder = "DOCKERFILE"`); the image `CMD`
+  runs `node adapters/migrate.mjs && node --import tsx server/index.js`, so migrations apply on boot
+  (idempotent + advisory-locked); healthcheck `/health`. (`nixpacks.toml` keeps an equivalent
+  Nixpacks start command for non-Docker builders.) Provide `DATABASE_URL`, `PUBLIC_KEY`,
   `PRIVATE_KEY`, `TRUST_DOMAIN`, and `DATABASE_SSL=require` for managed Postgres over TLS. The
   Postgres service **must** have pgvector (migration `0002` runs `CREATE EXTENSION vector`).
   Both `migrate.mjs` and the server honor `DATABASE_SSL` (`disable`|`require`|`verify`).
