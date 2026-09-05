@@ -255,8 +255,17 @@ export function parseConfig(env = {}) {
   } else if (srcLoad.raw.length && cfg.sources.length < srcLoad.raw.length) {
     cfg.warnings.push('Some SOURCES entries were dropped (each needs a unique id and a url/path).');
   }
+  const SUPPORTED_SOURCE_TYPES = ['git', 'postgres', 'http', 'github'];
   for (const s of cfg.sources) {
-    if (s.type !== 'git') cfg.warnings.push(`SOURCES: source "${s.id}" type "${s.type}" is unsupported (only "git").`);
+    if (!SUPPORTED_SOURCE_TYPES.includes(s.type)) {
+      cfg.warnings.push(`SOURCES: source "${s.id}" type "${s.type}" is unsupported (${SUPPORTED_SOURCE_TYPES.join(', ')}).`);
+    } else if (s.type === 'postgres' && !s.query) {
+      cfg.warnings.push(`SOURCES: postgres source "${s.id}" has no "query" — nothing will be ingested.`);
+    } else if (s.type === 'github' && (!s.repo || !String(s.repo).includes('/'))) {
+      cfg.warnings.push(`SOURCES: github source "${s.id}" needs repo "owner/name".`);
+    } else if ((s.type === 'http' || s.type === 'github') && !s.url && s.type === 'http') {
+      cfg.warnings.push(`SOURCES: http source "${s.id}" needs a "url".`);
+    }
   }
   if (cfg.sources.length && !cfg.privateKeyPem) {
     cfg.warnings.push('SOURCES configured but PRIVATE_KEY is not set — ingestion cannot sign memory.');

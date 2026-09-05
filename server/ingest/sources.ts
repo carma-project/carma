@@ -6,24 +6,30 @@
 
 export interface Source {
   id: string;
-  type: string; // 'git'
-  url: string; // git URL or local path
+  type: string; // git | postgres | http | github
+  url: string; // git URL / local path / http endpoint / postgres DSN
   trustDomain: string | null; // defaults to server TRUST_DOMAIN at run time
   branch: string | null;
-  since: string | null; // incremental window for history, e.g. "30 days ago"
+  since: string | null; // incremental window (git history / github "updated since")
   repo: string | null; // slug for URIs; derived from remote/dir when null
-  docs: boolean; // ingest markdown (specs / decisions / OS docs)
-  history: boolean; // ingest git commit history
+  docs: boolean; // git: ingest markdown (specs / decisions / OS docs)
+  history: boolean; // git: ingest commit history
   maxCommits: number;
   exclude: string[];
   intervalMinutes: number; // scheduler cadence; 0 = manual (POST /ingest) only
-  tokenEnv: string | null; // env var holding a git token for private https clones
+  tokenEnv: string | null; // env var holding a token (git/http/github auth)
+  // Connector-specific fields (postgres: dsn/dsnEnv/query/columns; http:
+  // headers/itemsPath/fields; github: apiBase/state/maxPages/includeComments)
+  // pass through untyped.
+  [key: string]: any;
 }
 
 export function normalizeSource(raw: any): Source {
   const n = Number(raw.intervalMinutes);
   const mc = Number(raw.maxCommits);
   return {
+    // Preserve connector-specific fields (query, dsnEnv, headers, fields, ...).
+    ...raw,
     id: String(raw.id),
     type: String(raw.type || 'git').toLowerCase(),
     url: String(raw.url || raw.path || ''),
@@ -40,14 +46,24 @@ export function normalizeSource(raw: any): Source {
   };
 }
 
+// Does a raw source carry enough of a locator for its connector type?
+// git/http need a url/path; postgres needs a dsn/dsnEnv (or a postgres url);
+// github needs a repo. (Deeper per-type validation happens in config warnings.)
+function hasLocator(raw: any): boolean {
+  const type = String(raw.type || 'git').toLowerCase();
+  if (type === 'postgres') return Boolean(raw.dsn || raw.dsnEnv || raw.url);
+  if (type === 'github') return Boolean(raw.repo || raw.url);
+  return Boolean(raw.url || raw.path);
+}
+
 // Parse an array of raw source objects into validated Sources, dropping entries
-// that are missing an id or url (callers surface a warning for those).
+// missing an id or a locator (callers surface a warning for those).
 export function parseSources(rawArr: any): Source[] {
   if (!Array.isArray(rawArr)) return [];
   const seen = new Set<string>();
   const out: Source[] = [];
   for (const raw of rawArr) {
-    if (!raw || !raw.id || !(raw.url || raw.path)) continue;
+    if (!raw || !raw.id || !hasLocator(raw)) continue;
     const s = normalizeSource(raw);
     if (seen.has(s.id)) continue; // ids must be unique (stable per source)
     seen.add(s.id);

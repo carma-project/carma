@@ -7,9 +7,21 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import type { TraceInput } from '../ingest.js';
+import type { TraceInput, OutcomeStatus } from '../ingest.js';
 
-export type ItemType = 'doc' | 'agent-spec' | 'decision' | 'commit';
+// Item types across all connectors: markdown/git (doc, agent-spec, decision,
+// commit), plus records pulled from other systems (row=SQL, record=HTTP JSON,
+// issue/pr=GitHub). Kept open (string) so new connectors can label their items.
+export type ItemType = 'doc' | 'agent-spec' | 'decision' | 'commit' | 'row' | 'record' | 'issue' | 'pr' | string;
+
+// An outcome a connector derives from a source signal (a git revert, a closed/
+// merged PR, a "not planned" issue): recorded against the decision it refers to.
+export interface OutcomeItem {
+  decisionUri: string;
+  status: OutcomeStatus;
+  score?: number;
+  evidence?: string;
+}
 
 // A ready-to-store memory: a deterministic URI + trust domain + the trace body.
 // storeTrace(adapter, {uri, trustDomain, ...}, item.input) or an equivalent
@@ -22,12 +34,7 @@ export interface IngestItem {
 }
 
 // A revert in history is outcome signal: the commit it undoes failed.
-export interface RevertOutcome {
-  decisionUri: string;
-  status: 'failure';
-  score: number;
-  evidence: string;
-}
+export type RevertOutcome = OutcomeItem & { status: 'failure' };
 
 export interface MarkdownOptions {
   domain: string;

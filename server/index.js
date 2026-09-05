@@ -74,7 +74,7 @@ async function runSourceTracked(source, opts = {}) {
       log: (event, detail) => logger.info(event, detail),
     });
     st.lastRunAt = report.finishedAt || new Date().toISOString();
-    st.lastResult = { dryRun: report.dryRun, docs: report.docs, commits: report.commits, outcomes: report.outcomes };
+    st.lastResult = { dryRun: report.dryRun, stored: report.stored, byType: report.byType, outcomes: report.outcomes };
     st.lastError = null;
     return report;
   } catch (e) {
@@ -901,7 +901,7 @@ const requestHandler = async (req, res) => {
               trustDomain: report.trustDomain,
               result: 'allow',
               requestId,
-              detail: { source: source.id, dryRun, docs: report.docs.count, commits: report.commits.count, outcomes: report.outcomes.count },
+              detail: { source: source.id, dryRun, stored: report.stored.count, failed: report.stored.failed, outcomes: report.outcomes.count, byType: report.byType },
             });
           } catch (e) {
             logger.error('ingest_error', { requestId, source: source.id, error: e.message });
@@ -961,7 +961,7 @@ async function runDueSources(reason, sources) {
     for (const source of sources) {
       try {
         const r = await runSourceTracked(source, { subject: reason });
-        logger.info('ingest_run', { reason, source: source.id, docs: r.docs.count, commits: r.commits.count, outcomes: r.outcomes.count });
+        logger.info('ingest_run', { reason, source: source.id, stored: r.stored.count, failed: r.stored.failed, outcomes: r.outcomes.count });
       } catch (e) {
         logger.error('ingest_run_error', { reason, source: source.id, error: e.message });
       }
