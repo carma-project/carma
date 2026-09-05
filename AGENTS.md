@@ -17,7 +17,15 @@ Guidance for coding agents working on CARMA (JSON-AM reference implementation).
 - End-to-end smoke test: `npm run smoke` (reads `PORT`/`TRUST_DOMAIN`/`PRIVATE_KEY`, mints a token
   in-process, exercises status/ingest/outcome/search/consolidate over `fetch`; no `curl`/`jq` needed,
   so it runs inside the `node:20-alpine` container). Override with `--url`/`--domain`/`--k`.
-- Ingest a repo's markdown (agent specs, decisions/ADRs, "company OS" docs) into memory:
+- **Native ingestion (recommended): CARMA pulls sources itself, in-process** — no external
+  cron/CI. Declare `SOURCES` (JSON) and either trigger `POST /ingest` (write; body
+  `{ sourceId?, dryRun? }`) or enable the scheduler (`INGEST_ON_BOOT` / `INGEST_SCHEDULER_ENABLED`
+  + per-source `intervalMinutes`). CARMA clones/updates the repo and stores markdown + git history
+  via `storeTrace` directly (signed with the server `PRIVATE_KEY`; no token minted). This is the
+  acquisition counterpart to `dream`, closing the loop **pull → consolidate → post-train** inside
+  the container. Shares extractors with the CLIs below. See `docs/INGEST_REPO.md` §0.
+- Ingest a repo's markdown (agent specs, decisions/ADRs, "company OS" docs) into memory *from
+  outside* (push via `POST /memory`; for air-gapped sources or ad-hoc backfills):
   `npm run ingest-repo -- --dir <path> --url <carma-url> --domain <domain> [--repo owner/name]
   [--dry-run] [--no-split] [--exclude a,b]`. Classifies by path/front-matter, splits on `#`/`##`,
   and upserts each section under a deterministic `trace://<domain>/gh/<repo>/<path>#<slug>` URI
@@ -29,12 +37,13 @@ Guidance for coding agents working on CARMA (JSON-AM reference implementation).
   decision (author date preserved via `occurredAt`), and reverts record a `failure` outcome on the
   commit they undo. Commits enter the `working` tier (episodic; decay unless recalled), vs. curated
   docs/ADRs which are `consolidated`.
-- Private CARMA (no public internet): the importers dial out to CARMA, so run the sync inside the
-  network. `scripts/sync-repo.sh` runs both importers for one checkout (env: `CARMA_URL`,
+- Private CARMA (no public internet): prefer **native ingestion** above — if CARMA can reach the
+  repo it needs no external runner. Otherwise the importers dial out to CARMA, so run the sync
+  inside the network: `scripts/sync-repo.sh` runs both importers for one checkout (env: `CARMA_URL`,
   `TRUST_DOMAIN`, `REPO_DIR`, `REPO_SLUG`, `PRIVATE_KEY`/`CARMA_TOKEN`). For Railway, deploy
   `docs/examples/Dockerfile.sync` as a cron service in the same project (reaches
-  `carma.railway.internal`). Note: git-history import needs `git`, which is not in the alpine
-  runtime image. See `docs/INGEST_REPO.md` §2c.
+  `carma.railway.internal`). The CARMA runtime image now includes `git` (needed for the native and
+  history importers). See `docs/INGEST_REPO.md` §2c.
 - Tests: `npm test` (unit always; integration + MCP tests run only when `DATABASE_URL` is set).
 
 The entrypoint `server/index.js` imports its middleware/adapters with `.js` specifiers, but
@@ -90,6 +99,16 @@ Production/hardening:
   used for consolidation reasoning (near-duplicate proposals + episodic→semantic gisting). `local` is
   deterministic and offline; `fireworks` uses an OpenAI-compatible chat endpoint and falls back to
   local on any error. Provider-neutral — bring any backend.
+Native ingestion (sources CARMA pulls itself):
+- `SOURCES` (inline JSON array) or `SOURCES_FILE` (path to that JSON) — source definitions. Each:
+  `{ id, type:"git", url, repo?, branch?, since?, docs?, history?, maxCommits?, exclude?,
+  intervalMinutes?, tokenEnv? }`. `url` may be a git URL or a local path; `tokenEnv` names an env var
+  holding a PAT for private https clones. `intervalMinutes>0` makes a source eligible for the scheduler.
+- `INGEST_WORK_DIR` (`/tmp/carma-sources`) — where checkouts are cloned/cached (fast-forwarded on re-run).
+- `INGEST_ON_BOOT` (`false`) — pull all sources once shortly after startup (first-deploy backfill).
+- `INGEST_SCHEDULER_ENABLED` (`false`) / `INGEST_SCHEDULER_TICK_MS` (`60000`) — run due sources on
+  their `intervalMinutes` cadence. Runs are serialized (a manual `POST /ingest` and the scheduler
+  never overlap). `GET /api/status` reports each source and its last run under `ingest.sources[]`.
 - `LOG_LEVEL` (`info`) — structured JSON logs; each request gets an `X-Request-Id`.
 - `HSTS_ENABLED` (`false`) — send HSTS (enable when TLS terminates at/after the proxy).
 - `STRICT_BOOT` (`false`) — fail fast at startup if `PUBLIC_KEY`/`PRIVATE_KEY`/`DATABASE_URL`
@@ -144,6 +163,11 @@ Production/hardening:
   Returns a report: memories archived (decay), promoted (tier recompute), near-duplicate reviews
   raised (each with a model-proposed resolution), and semantic memories abstracted. `dryRun:true`
   reports intended changes without mutating.
+- `POST /ingest` — native ingestion: pull a configured source into memory in-process (write). Body:
+  `{ sourceId?, dryRun?, trustDomain? }` (omit `sourceId` to run all). Clones/updates the git source
+  and stores its markdown + history via `storeTrace`; `dryRun:true` reports counts without writing.
+  Returns `{ dryRun, reports:[{ sourceId, repo, docs, commits, outcomes }] }`. `409` if a run is
+  already in progress; `404` for an unknown `sourceId`.
 - `POST /distill` — distill stored reasoning/memory into a fine-tune job (capability action
   `distill`). Body: `{ trustDomain?, kind?, since?, limit?, format?, baseModel?, suffix? }`.
   Returns `{ datasetUri, examples, provider, baseModel, jobId, status, model }`.

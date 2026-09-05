@@ -5,14 +5,66 @@ Turn the knowledge you already have — agent specs, decision records (ADRs), an
 your agents can pull the relevant precedent at decision time via `GET /search` or
 the MCP `search_memory` tool, instead of re-deriving it from scratch.
 
-Two importers cover "everything in the repo":
+There are two ways to get a repo in, and they share the same extraction logic
+(`server/ingest/extract.ts`), so a repo looks identical however it arrives:
 
-- `scripts/ingest-repo.mjs` (`npm run ingest-repo`) — current **markdown** (specs, ADRs, OS docs).
-- `scripts/ingest-git.mjs` (`npm run ingest-git`) — **git history**, the reasoning behind every
-  change, with original dates preserved (see §2b).
+- **Native ingestion (recommended):** CARMA pulls configured sources into its own memory,
+  in-process, on a schedule — no external cron/CI, no round-trip token. This is the acquisition
+  side of the memory architecture, the counterpart to the `dream` consolidation pass. See §0.
+- **External importers:** `scripts/ingest-repo.mjs` / `scripts/ingest-git.mjs` push a repo into
+  CARMA via `POST /memory` from anywhere with network access to CARMA. Use these for air-gapped
+  sources CARMA can't reach, or ad-hoc backfills. See §1–§2c.
 
-Both walk the source, classify content, and upsert signed JSON-AM `trace://` envelopes via
-`POST /memory` under deterministic, idempotent URIs.
+Both cover "everything in the repo": current **markdown** (specs, ADRs, OS docs) *and* **git
+history** — the reasoning behind every change, with original dates preserved (§2b). Content is
+classified and upserted as signed JSON-AM `trace://` envelopes under deterministic, idempotent URIs.
+
+## 0. Native ingestion (CARMA pulls the repo itself)
+
+Declare your systems as **sources** and CARMA maintains its own memory from them — the same way it
+already runs consolidation ("dreaming") internally. Nothing external is required; the standalone
+container clones/updates the repo and stores memory itself (its runtime image ships with `git`).
+
+Configure `SOURCES` (inline JSON) or `SOURCES_FILE` (a path to that JSON):
+
+```jsonc
+// SOURCES = [ ... ]
+[
+  {
+    "id": "handbook",                       // stable id (used for scheduling/state)
+    "type": "git",                          // only connector today; more coming
+    "url": "https://github.com/acme/handbook.git",  // or a local path CARMA can read
+    "repo": "acme/handbook",                // slug for URIs (auto-derived if omitted)
+    "branch": "main",                        // optional
+    "docs": true,                            // ingest markdown (default true)
+    "history": true,                         // ingest git commits (default true)
+    "intervalMinutes": 60,                   // scheduler cadence; 0/omitted = manual only
+    "tokenEnv": "HANDBOOK_GIT_TOKEN"         // env var with a PAT for private https clones
+  }
+]
+```
+
+Then either trigger a pull on demand or let the scheduler do it:
+
+```sh
+# On demand (write capability). Omit sourceId to run every source; dryRun previews counts.
+curl -s -X POST "$CARMA_URL/ingest" -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' --data '{"sourceId":"handbook"}'
+
+# Automatic: set once on the CARMA service
+INGEST_ON_BOOT=true               # backfill all sources shortly after startup
+INGEST_SCHEDULER_ENABLED=true     # then pull each source on its intervalMinutes
+```
+
+Config vars: `SOURCES` / `SOURCES_FILE`, `INGEST_WORK_DIR` (checkout cache, default
+`/tmp/carma-sources`), `INGEST_ON_BOOT`, `INGEST_SCHEDULER_ENABLED`, `INGEST_SCHEDULER_TICK_MS`.
+`GET /api/status` reports each source and its last run under `ingest.sources[]`.
+
+Because native ingestion runs server-internal (trusted, like `dream`), it signs memory with the
+server's `PRIVATE_KEY` directly — no capability token is minted for the write path. Bulk pulls skip
+per-write near-duplicate review (that would flood the queue); run `POST /consolidate` (`npm run
+dream`) afterwards to dedup and abstract. This closes the loop entirely inside the container:
+**pull** (ingest) → **consolidate** (dream) → **post-train** (`POST /distill`).
 
 ## How files are mapped
 
@@ -113,6 +165,11 @@ PRIVATE_KEY="$(cat priv.pem)" npm run ingest-git -- \
 Flags mirror the markdown importer plus `--branch`, `--since`, `--until`, `--max`, `--no-outcomes`.
 
 ## 2c. When CARMA is private (not on the public internet)
+
+> **Simplest answer: use native ingestion (§0).** If CARMA can reach the repo (public GitHub, or a
+> git host inside your network), let CARMA pull it — `SOURCES` + `INGEST_SCHEDULER_ENABLED` need no
+> external runner at all. The options below are for the reverse case: CARMA is private *and* you
+> prefer to push from an external box, or the source is somewhere only that box can reach.
 
 The importer makes an **outbound** connection to CARMA, so it just has to run somewhere with
 network access to your CARMA URL. GitHub-hosted Actions runners live on the public internet and
