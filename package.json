@@ -5,7 +5,11 @@
   "type": "module",
   "scripts": {
     "start": "node --import tsx server/index.js",
-    "dev": "tsx server/index.js"
+    "dev": "tsx server/index.js",
+    "mcp": "node --import tsx server/mcp/stdio.ts",
+    "migrate": "node adapters/migrate.mjs",
+    "mint-token": "node --import tsx scripts/mint-token.mjs",
+    "test": "node --import tsx --test test/*.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
