@@ -5,9 +5,14 @@ Turn the knowledge you already have — agent specs, decision records (ADRs), an
 your agents can pull the relevant precedent at decision time via `GET /search` or
 the MCP `search_memory` tool, instead of re-deriving it from scratch.
 
-The importer (`scripts/ingest-repo.mjs`, `npm run ingest-repo`) walks a directory,
-classifies each markdown file, splits it into sections for sharp recall, and upserts
-each section as a signed JSON-AM `trace://` envelope via `POST /memory`.
+Two importers cover "everything in the repo":
+
+- `scripts/ingest-repo.mjs` (`npm run ingest-repo`) — current **markdown** (specs, ADRs, OS docs).
+- `scripts/ingest-git.mjs` (`npm run ingest-git`) — **git history**, the reasoning behind every
+  change, with original dates preserved (see §2b).
+
+Both walk the source, classify content, and upsert signed JSON-AM `trace://` envelopes via
+`POST /memory` under deterministic, idempotent URIs.
 
 ## How files are mapped
 
@@ -79,6 +84,33 @@ Configure two repo secrets:
 > short-lived token per run. For a stricter posture, front CARMA with an mTLS proxy and
 > issue tokens via `POST /capability` (see `docs/DEPLOY_RAILWAY.md`) instead of putting
 > the signing key in CI.
+
+## 2b. Ingest git history (the *why* behind every change)
+
+If "all your company history lives in the repo," most of it is in **git history**, not just
+the current markdown. `scripts/ingest-git.mjs` (`npm run ingest-git`) imports commits as dated
+decisions so that reasoning is recallable too:
+
+```sh
+PRIVATE_KEY="$(cat priv.pem)" npm run ingest-git -- \
+  --dir /path/to/your/repo --url https://carma.up.railway.app \
+  --domain cyberorbit --repo cyberorbit/app --max 100000     # full backfill
+# incremental (e.g. nightly):  --since "30 days ago"   or  --since 2024-01-01
+```
+
+- Each commit → `trace://<domain>/gh/<repo>/commit/<sha>` with `decision.choice` = the subject
+  and the body as reasoning. Immutable shas make it idempotent.
+- **Chronology is preserved:** the commit's author date is sent as `occurredAt`, which sets the
+  envelope `issuedAt` and the stored `created_at` that recall's recency decay reads. A backfill of
+  years of history keeps its real timeline instead of collapsing to "now". (`provenance.createdAt`
+  still records the ingest time for audit.)
+- **Outcome signal from history:** a `Revert …` commit records a `failure` outcome on the commit it
+  undoes, so recall learns which changes didn't hold.
+- Commits enter the **`working`** tier (episodic — they decay unless recalled/reinforced), while
+  curated docs/ADRs from the markdown importer are `consolidated`. Run `npm run dream` periodically
+  to consolidate recurring patterns and let stale one-offs fade.
+
+Flags mirror the markdown importer plus `--branch`, `--since`, `--until`, `--max`, `--no-outcomes`.
 
 ## 3. How your agents recall it
 

@@ -15,6 +15,9 @@ export interface MemoryRecord {
   confidence?: number | null;
   importance?: number | null;
   tier?: string;
+  // Optional historical event time for backfills (e.g. a commit's author date).
+  // When omitted, the row's created_at defaults to now(). Preserved on upsert.
+  createdAt?: string | null;
 }
 
 // Recall ranking weights. Blends semantic similarity with an outcome signal
@@ -96,8 +99,8 @@ export class PostgresAdapter {
     const query = `
       INSERT INTO agent_memory
         (uri, kind, trust_domain, envelope, signature, content, embedding,
-         status, supersedes, outcome_status, outcome_score, confidence, importance, tier)
-      VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10, $11, $12, $13, $14)
+         status, supersedes, outcome_status, outcome_score, confidence, importance, tier, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10, $11, $12, $13, $14, COALESCE($15::timestamptz, now()))
       ON CONFLICT (uri) DO UPDATE SET
         kind = EXCLUDED.kind,
         trust_domain = EXCLUDED.trust_domain,
@@ -128,6 +131,7 @@ export class PostgresAdapter {
       rec.confidence ?? null,
       rec.importance ?? null,
       rec.tier ?? 'working',
+      rec.createdAt ?? null,
     ]);
     return res.rows[0];
   }

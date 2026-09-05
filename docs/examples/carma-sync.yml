@@ -31,6 +31,8 @@ jobs:
     steps:
       - name: Checkout knowledge repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so recent commits can be ingested too
 
       - name: Checkout CARMA (importer)
         uses: actions/checkout@v4
@@ -54,6 +56,21 @@ jobs:
           node --import tsx scripts/ingest-repo.mjs \
             --dir "$GITHUB_WORKSPACE" \
             --exclude .carma \
+            --url "$CARMA_URL" \
+            --domain cyberorbit \
+            --repo "${{ github.repository }}"
+
+      # Also capture the reasoning in recent commits (the "why"). For the initial
+      # full-history backfill, run ingest-git once locally with --max 100000.
+      - name: Ingest recent git history into CARMA
+        env:
+          CARMA_URL: ${{ secrets.CARMA_URL }}
+          PRIVATE_KEY: ${{ secrets.CARMA_PRIVATE_KEY }}
+        run: |
+          cd .carma
+          node --import tsx scripts/ingest-git.mjs \
+            --dir "$GITHUB_WORKSPACE" \
+            --since "14 days ago" \
             --url "$CARMA_URL" \
             --domain cyberorbit \
             --repo "${{ github.repository }}"

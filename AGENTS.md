@@ -23,6 +23,12 @@ Guidance for coding agents working on CARMA (JSON-AM reference implementation).
   and upserts each section under a deterministic `trace://<domain>/gh/<repo>/<path>#<slug>` URI
   (idempotent — safe to re-run per push). Auth via `--token`/`CARMA_TOKEN`, else mints from
   `PRIVATE_KEY`. Full guide + GitHub Actions sync template: `docs/INGEST_REPO.md`.
+- Ingest a repo's **git history** (the reasoning behind every change): `npm run ingest-git -- --dir
+  <path> --url <carma-url> --domain <domain> [--repo owner/name] [--since "30 days ago"] [--branch b]
+  [--max N] [--dry-run]`. Each commit becomes a dated `trace://<domain>/gh/<repo>/commit/<sha>`
+  decision (author date preserved via `occurredAt`), and reverts record a `failure` outcome on the
+  commit they undo. Commits enter the `working` tier (episodic; decay unless recalled), vs. curated
+  docs/ADRs which are `consolidated`.
 - Tests: `npm test` (unit always; integration + MCP tests run only when `DATABASE_URL` is set).
 
 The entrypoint `server/index.js` imports its middleware/adapters with `.js` specifiers, but

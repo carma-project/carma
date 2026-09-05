@@ -245,7 +245,15 @@ function validateTraceInput(body) {
   let supersedes = null;
   if (body.supersedes != null) supersedes = sanitizeUri(body.supersedes);
 
-  return { task, content, boundContext, decision, outcome, confidence, importance, supersedes };
+  let occurredAt = null;
+  if (body.occurredAt != null) {
+    if (typeof body.occurredAt !== 'string' || Number.isNaN(Date.parse(body.occurredAt))) {
+      throw new Error('occurredAt must be an ISO 8601 date string');
+    }
+    occurredAt = new Date(body.occurredAt).toISOString();
+  }
+
+  return { task, content, boundContext, decision, outcome, confidence, importance, supersedes, occurredAt };
 }
 
 const OUTCOME_STATUSES = ['pending', 'success', 'failure', 'mixed', 'unknown'];
