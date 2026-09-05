@@ -6,6 +6,24 @@ Reference implementation of JSON-AM v0.1.2-draft.
 
 CARMA resolves `memory://`, `context://`, `trace://` URIs over HTTP, verifies JWT capability tokens, signs envelopes with JWS Ed25519, ingests reasoning traces into a pgvector-backed RAG index, and exposes memories/traces as MCP tools and resources.
 
+## For companies
+
+In the AI era, models are rented and commoditizing — your durable advantage is
+**owned, portable, governed memory of your own reasoning**. CARMA is the open,
+self-hostable substrate for that layer:
+
+- **Own your memory, avoid lock-in.** An open standard (JSON-AM) + MCP means any
+  agent or model plugs into the same memory you control — not a vendor's silo.
+- **Governed by design.** Trust-domain isolation, least-privilege capability
+  tokens, Ed25519-signed provenance, and an append-only audit log make agent
+  memory safe for regulated and multi-tenant use.
+- **Reasoning as reusable capital.** Traces are retrievable by meaning (RAG) and
+  can be distilled into specialized models — interaction history becomes an asset.
+
+See [`docs/WHY_CARMA.md`](docs/WHY_CARMA.md) for the full rationale, including how
+[Cyberorbit](docs/WHY_CARMA.md#applied-carma-on-cyberorbit-ai-pentesting) uses
+CARMA as the governed memory/trace store for AI pentesting.
+
 ## Quick start
 
 ```bash
