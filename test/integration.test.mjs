@@ -42,6 +42,13 @@ test(
       assert.ok(results.length >= 2);
       assert.equal(results[0].uri, dbTrace);
       assert.ok(Number(results[0].score) >= Number(results[results.length - 1].score));
+
+      // Append-only audit trail is writable and the table is reported ready.
+      const chk = await adapter.check();
+      assert.equal(chk.auditReady, true);
+      await adapter.audit({ actor: 'itest', action: 'read', uri: dbTrace, trustDomain: dom, result: 'allow', requestId: 'r-' + dom });
+      const c = await adapter.query('SELECT count(*)::int AS n FROM audit_log WHERE request_id = $1', ['r-' + dom]);
+      assert.equal(c.rows[0].n, 1);
     } finally {
       await adapter.close();
     }
