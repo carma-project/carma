@@ -10,7 +10,13 @@
 - **[partial]** Token validation includes exp/nbf/iat (via `jose`); iss/aud checks are planned
 - **[done]** Token lifetime max 15 min write / 60 min read — enforced per action
   (`enforceTokenLifetime`, configurable via `TOKEN_MAX_AGE_*`)
-- **[planned]** Refresh endpoint `POST /capability` requires mTLS client cert
+- **[done]** Issuance/refresh endpoint `POST /capability` gated by mTLS client cert
+  (`server/mtls.js`, `server/capability_issue.js`). Off by default
+  (`CAPABILITY_ENDPOINT_ENABLED`); identity is a verified client cert (direct TLS,
+  `MTLS_MODE=direct`) or a trusted proxy's forwarded identity (`MTLS_MODE=proxy`).
+  Issued grants are bounded by policy (`CAPABILITY_DOMAINS`, `CAPABILITY_MAX_ACTIONS`,
+  `CAPABILITY_MAX_TTL`) and, on refresh, by any presented token — refresh can never
+  escalate. Clients never hold the signing key.
 
 ## 2. Authorization
 - **[done]** Trust domain isolation enforced at the resolver (`enforceCapability`)
@@ -27,7 +33,9 @@
 - **[partial]** Provenance recorded on each envelope; immutability relies on the append-only store
 
 ## 4. Transport
-- **[planned]** TLS 1.3 mandatory (terminate at the platform/proxy in front of CARMA)
+- **[partial]** TLS mandatory in production — terminate at the platform/proxy in front of
+  CARMA. When `MTLS_MODE=direct`, CARMA itself terminates TLS (min TLS 1.2) so it can
+  verify client certs for `POST /capability`.
 - **[done]** MCP over stdio (trusted local) and Streamable HTTP (`POST /mcp`); HTTP sessions
   require a bearer capability token and enforce per-session actions (read/write). Terminate TLS
   at the platform/proxy in front of the HTTP transport.

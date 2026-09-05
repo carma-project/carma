@@ -78,6 +78,16 @@ Production/hardening:
   are missing (recommended in production).
 - `MCP_HTTP_ENABLED` (default `true`) / `MCP_HTTP_PATH` (default `/mcp`) — expose the MCP
   Streamable HTTP transport on the main server so remote agent harnesses can connect.
+- `CAPABILITY_ENDPOINT_ENABLED` (`false`) — enable `POST /capability` (mTLS-gated token
+  issuance/refresh). When enabled:
+  - `MTLS_MODE` (`direct`) — `direct`: CARMA terminates TLS and verifies the client cert against
+    `CAPABILITY_CLIENT_CA` (needs `TLS_CERT`/`TLS_KEY`; upgrades the listener to HTTPS).
+    `proxy`: trust a TLS-terminating proxy's forwarded identity when the request carries
+    `CAPABILITY_PROXY_SECRET` (headers `CAPABILITY_PROXY_SECRET_HEADER`/`_SUBJECT_HEADER`/
+    `_VERIFY_HEADER`/`_FINGERPRINT_HEADER`).
+  - `CAPABILITY_DOMAINS` (default `TRUST_DOMAIN`), `CAPABILITY_MAX_ACTIONS` (default `read,write`),
+    `CAPABILITY_MAX_TTL` (default `15m`) — ceilings for issued grants.
+  - `CAPABILITY_TRUSTED_FINGERPRINTS` — optional allow-list of client-cert SHA-256 fingerprints.
 
 ## Endpoints
 
@@ -87,6 +97,13 @@ Production/hardening:
 - `GET /health` — liveness (always `200` while the process is up).
 - `GET /ready` — readiness (`200` only when it can serve: key valid + DB connected + schema);
   `503` otherwise. Use this for orchestrator readiness probes.
+- `POST /capability` — mTLS-gated capability issuance/refresh (off unless
+  `CAPABILITY_ENDPOINT_ENABLED`). No bearer token; the caller is authenticated by a client cert
+  (direct TLS) or a trusted proxy's forwarded identity. Body: `{ domains?, actions?, ttl? }`
+  (all optional; each is intersected with policy). Optional `Authorization: Bearer <token>`
+  narrows the new grant on refresh (never widens). Returns `{ token, subject, domains, actions,
+  expiresIn }`. `404` when disabled, `401` without a verified client identity. Lets clients
+  (e.g. Cyberorbit) request scoped, short-lived tokens without holding the signing key.
 - `GET /resolve?uri=...` — resolve an envelope by URI (read capability).
 - `POST /memory` — ingest a decision/reasoning trace as a signed `trace://` envelope + recall
   index entry (write capability). Body: `{ task?, content, boundContext?, decision?, outcome?,

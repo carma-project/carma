@@ -55,6 +55,29 @@ Do **not** set `PORT` — Railway injects it and the server honors it.
 Multi-line values (the PEM keys) paste fine in Railway's variable editor; keep the
 `-----BEGIN/END-----` lines intact.
 
+### Optional: mTLS-gated token issuance (`POST /capability`)
+
+By default, tokens are minted out-of-band with `npm run mint-token` (needs `PRIVATE_KEY`).
+Enable `POST /capability` so clients (e.g. Cyberorbit) request scoped, short-lived tokens
+without ever holding the signing key. It is **off by default** and gated by a verified
+client certificate.
+
+Railway terminates TLS at its edge and does **not** perform client-certificate mTLS there,
+so pick one of:
+
+- **`MTLS_MODE=proxy`** (works on Railway) — put your own mTLS-terminating proxy (nginx,
+  Envoy, a gateway) in front of CARMA. The proxy verifies the client cert and forwards the
+  identity plus a shared secret. Set `CAPABILITY_ENDPOINT_ENABLED=true`, `MTLS_MODE=proxy`,
+  `CAPABILITY_PROXY_SECRET=<random>`, and have the proxy send `x-proxy-authorization: <secret>`,
+  `x-client-subject: <cn>` (optionally `x-client-verify: SUCCESS`, `x-client-fingerprint: <sha256>`).
+- **`MTLS_MODE=direct`** (self-hosted / L4 passthrough) — CARMA terminates TLS itself. Set
+  `TLS_CERT`, `TLS_KEY`, and `CAPABILITY_CLIENT_CA` (PEMs); the listener becomes HTTPS and
+  verifies client certs against that CA.
+
+Bound what can be issued with `CAPABILITY_DOMAINS` (default `TRUST_DOMAIN`),
+`CAPABILITY_MAX_ACTIONS` (default `read,write`), and `CAPABILITY_MAX_TTL` (default `15m`).
+A presented (still-valid) token narrows the refreshed grant — refresh can never escalate.
+
 ## 4. Deploy
 
 On boot the start command runs `node adapters/migrate.mjs` (idempotent,
