@@ -10,6 +10,8 @@ import { embed, toVectorLiteral } from './embedding.js';
 import { storeTrace, newTraceUri, recordOutcome, retractMemory } from './ingest.js';
 import { toPrecedent, weightsFromConfig, policyFromConfig } from './recall.js';
 import { runDistillation, fineTuneStatus } from './distill/pipeline.js';
+import { runDream } from './consolidate/dream.js';
+import { getMemoryModel } from './memory/model.js';
 import { CARMAMCPServer } from './mcp/index.js';
 import { PostgresAdapter } from '../adapters/postgres.js';
 import { config, redactedSummary } from './config.js';
@@ -37,6 +39,7 @@ const adapter = new PostgresAdapter(config.databaseUrl, {
   idleTimeoutMillis: config.dbIdleTimeoutMs,
   connectionTimeoutMillis: config.dbConnectTimeoutMs,
 });
+const memoryModel = getMemoryModel(config);
 const audit = new Audit(adapter, logger, { enabled: Boolean(config.databaseUrl) });
 const limiter = new RateLimiter({ rps: config.rateLimitRps, burst: config.rateLimitBurst });
 
@@ -659,6 +662,52 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         logger.error('finetune_status_error', { requestId, error: e.message });
         return sendJson(res, 502, { error: e.message });
+      }
+    }
+
+    // Offline consolidation ("dreaming"): decay stale working memories, recompute
+    // tiers from outcomes, batch-detect near-duplicates into the review queue with
+    // a model-proposed resolution, and abstract recurring decisions into semantic
+    // memories. Mutates memory lifecycle -> gated on 'write'. `dryRun` reports only.
+    if (path === '/consolidate' && req.method === 'POST') {
+      if (rateLimited(req, res, requestId)) return;
+      let body;
+      try {
+        body = await readJsonBody(req, config.bodyLimitBytes);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      const trustDomain = body.trustDomain || config.trustDomain;
+      if (!trustDomain) return sendJson(res, 400, { error: 'trustDomain not set (body.trustDomain or TRUST_DOMAIN)' });
+      let claims;
+      try {
+        claims = await authorize(req, `memory://${trustDomain}/consolidate`, 'write');
+      } catch (e) {
+        audit.record({ action: 'consolidate', trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const report = await runDream(adapter, memoryModel, config, {
+          trustDomain,
+          subject: claims.sub,
+          privateKeyPem: config.privateKeyPem,
+          dryRun: body.dryRun === true,
+          steps: Array.isArray(body.steps) && body.steps.length ? body.steps : undefined,
+          limit: body.limit,
+        });
+        audit.record({
+          actor: claims.sub,
+          action: 'consolidate',
+          trustDomain,
+          result: 'allow',
+          requestId,
+          detail: { dryRun: report.dryRun, decayed: report.decayed.count, promoted: report.promoted.count, reviews: report.reviews.count, abstractions: report.abstractions.count },
+        });
+        return sendJson(res, 200, report);
+      } catch (e) {
+        logger.error('consolidate_error', { requestId, error: e.message });
+        audit.record({ action: 'consolidate', trustDomain, result: 'error', requestId, detail: { error: e.message } });
+        return sendJson(res, 400, { error: e.message });
       }
     }
 

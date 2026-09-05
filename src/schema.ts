@@ -69,3 +69,24 @@ export interface OutcomeReport extends EnvelopeBase {
   decisionUri: string;
   outcome: Outcome;
 }
+
+// A distilled, reusable principle abstracted from several concrete decisions on
+// the same task during offline consolidation ("dreaming"). It is episodic memory
+// promoted to semantic memory: the recurring "what we do and why" plus links back
+// to the source decisions it generalizes. Semantic memories are recall-indexed and
+// feed distillation.
+export interface Semantic extends EnvelopeBase {
+  type: 'Semantic';
+  task: string;
+  content: string; // the principle / summary
+  semantic: {
+    principle: string; // the recommended choice / rule of thumb
+    derivedFrom: string[]; // source decision URIs
+    supportCount: number; // how many decisions it generalizes
+    successRate?: number; // fraction of sources with a success outcome
+    model?: string; // which memory model produced it (provenance)
+  };
+  confidence?: number;
+  importance?: number;
+  status?: MemoryStatus;
+}

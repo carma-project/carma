@@ -155,13 +155,45 @@ export class PostgresAdapter {
   }
 
   // --- Consolidation review queue -------------------------------------------
-  async enqueueReview(item: { trustDomain: string; candidateUri: string; similarUri: string; similarity: number }) {
+  async enqueueReview(item: {
+    trustDomain: string;
+    candidateUri: string;
+    similarUri: string;
+    similarity: number;
+    proposedResolution?: string | null;
+    proposedReason?: string | null;
+    source?: string;
+  }) {
     const res = await this.pool.query(
-      `INSERT INTO memory_review (trust_domain, candidate_uri, similar_uri, similarity)
-       VALUES ($1, $2, $3, $4) RETURNING id`,
-      [item.trustDomain, item.candidateUri, item.similarUri, item.similarity]
+      `INSERT INTO memory_review
+         (trust_domain, candidate_uri, similar_uri, similarity, proposed_resolution, proposed_reason, source)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      [
+        item.trustDomain,
+        item.candidateUri,
+        item.similarUri,
+        item.similarity,
+        item.proposedResolution ?? null,
+        item.proposedReason ?? null,
+        item.source ?? 'ingest',
+      ]
     );
     return res.rows[0].id;
+  }
+
+  // Is there already an open (pending) review for this near-duplicate pair, in
+  // either ordering? Keeps the batch dream pass from re-raising the same pair.
+  async reviewExistsFor(trustDomain: string | null, aUri: string, bUri: string) {
+    const res = await this.pool.query(
+      `SELECT 1 FROM memory_review
+       WHERE status = 'pending'
+         AND ($1::text IS NULL OR trust_domain = $1)
+         AND ((candidate_uri = $2 AND similar_uri = $3)
+           OR (candidate_uri = $3 AND similar_uri = $2))
+       LIMIT 1`,
+      [trustDomain, aUri, bUri]
+    );
+    return res.rows.length > 0;
   }
 
   async listReviews(opts: { trustDomain?: string | null; status?: string; limit?: number } = {}) {
@@ -175,7 +207,8 @@ export class PostgresAdapter {
     where += ` AND status = $${params.length}`;
     params.push(Math.min(opts.limit ?? 100, 1000));
     const res = await this.pool.query(
-      `SELECT id, trust_domain, candidate_uri, similar_uri, similarity, status, created_at
+      `SELECT id, trust_domain, candidate_uri, similar_uri, similarity, status,
+              proposed_resolution, proposed_reason, source, created_at
        FROM memory_review WHERE ${where} ORDER BY created_at ASC LIMIT $${params.length}`,
       params
     );
@@ -373,6 +406,94 @@ export class PostgresAdapter {
       ORDER BY created_at ASC
       LIMIT $${params.length}`;
     const res = await this.pool.query(query, params);
+    return res.rows;
+  }
+
+  // --- Offline consolidation ("dreaming") -----------------------------------
+
+  // List memories with the lifecycle signals the dream job reasons over
+  // (age, reinforcement, outcome, tier, recall-indexed?), plus the envelope so
+  // recurring decisions can be grouped by task for episodic->semantic abstraction.
+  async listActiveMemories(opts: {
+    trustDomain?: string | null;
+    kind?: string | null;
+    tier?: string | null;
+    limit?: number;
+  } = {}) {
+    const params: any[] = [];
+    let where = "status = 'active'";
+    if (opts.trustDomain) {
+      params.push(opts.trustDomain);
+      where += ` AND trust_domain = $${params.length}`;
+    }
+    if (opts.kind) {
+      params.push(opts.kind);
+      where += ` AND kind = $${params.length}`;
+    }
+    if (opts.tier) {
+      params.push(opts.tier);
+      where += ` AND tier = $${params.length}`;
+    }
+    params.push(Math.min(opts.limit ?? 5000, 100000));
+    const res = await this.pool.query(
+      `SELECT uri, kind, trust_domain, tier, status, reinforcement_count,
+              outcome_status, outcome_score, confidence, importance, envelope,
+              (embedding IS NOT NULL) AS indexed,
+              created_at,
+              last_reinforced_at,
+              EXTRACT(EPOCH FROM (now() - created_at)) / 86400.0 AS age_days
+       FROM agent_memory
+       WHERE ${where}
+       ORDER BY created_at ASC
+       LIMIT $${params.length}`,
+      params
+    );
+    return res.rows;
+  }
+
+  // Batch near-duplicate detection: for each active recall-indexed memory, find
+  // its single nearest other neighbor; return unique pairs at/above `threshold`.
+  // Pair de-duplication and open-review filtering are done by the caller.
+  async findNearDuplicatePairs(opts: {
+    trustDomain?: string | null;
+    kind?: string | null;
+    threshold: number;
+    limit?: number;
+  }) {
+    const params: any[] = [];
+    let inner = "b.embedding IS NOT NULL AND b.status = 'active' AND b.uri <> a.uri";
+    let outer = "a.embedding IS NOT NULL AND a.status = 'active'";
+    if (opts.trustDomain) {
+      params.push(opts.trustDomain);
+      const p = `$${params.length}`;
+      inner += ` AND b.trust_domain = ${p}`;
+      outer += ` AND a.trust_domain = ${p}`;
+    }
+    if (opts.kind) {
+      params.push(opts.kind);
+      const p = `$${params.length}`;
+      inner += ` AND b.kind = ${p}`;
+      outer += ` AND a.kind = ${p}`;
+    }
+    params.push(opts.threshold);
+    const pThresh = params.length;
+    params.push(Math.min(opts.limit ?? 500, 10000));
+    const pLimit = params.length;
+    const res = await this.pool.query(
+      `SELECT a.uri AS a_uri, n.uri AS b_uri, n.similarity
+       FROM agent_memory a
+       CROSS JOIN LATERAL (
+         SELECT b.uri, 1 - (a.embedding <=> b.embedding) AS similarity
+         FROM agent_memory b
+         WHERE ${inner}
+         ORDER BY a.embedding <=> b.embedding
+         LIMIT 1
+       ) n
+       WHERE ${outer} AND n.similarity >= $${pThresh}
+       ORDER BY n.similarity DESC
+       LIMIT $${pLimit}`,
+      params
+    );
     return res.rows;
   }
 

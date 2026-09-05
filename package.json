@@ -10,6 +10,7 @@
     "migrate": "node adapters/migrate.mjs",
     "mint-token": "node --import tsx scripts/mint-token.mjs",
     "distill": "node --import tsx scripts/distill.mjs",
+    "dream": "node --import tsx scripts/dream.mjs",
     "test": "node --import tsx --test test/*.test.mjs"
   },
   "dependencies": {
