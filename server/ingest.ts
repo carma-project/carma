@@ -91,8 +91,15 @@ export async function storeTrace(adapter: any, ctx: IngestContext, input: TraceI
   if (!ctx.privateKeyPem) throw new Error('Server missing PRIVATE_KEY for signing');
 
   const now = new Date().toISOString();
-  // Event time for historical backfills; falls back to ingest time.
-  const occurredAt = input?.occurredAt ?? null;
+  // Event time for historical backfills (e.g. a commit's author date); falls
+  // back to ingest time. Normalized to canonical ISO here so the in-process
+  // path matches the HTTP path (which normalizes in validateTraceInput); an
+  // unparseable value is ignored rather than corrupting the envelope.
+  let occurredAt: string | null = null;
+  if (input?.occurredAt) {
+    const d = new Date(input.occurredAt);
+    if (!Number.isNaN(d.getTime())) occurredAt = d.toISOString();
+  }
   const issuedAt = occurredAt || now;
   const envelope: any = {
     '@context': 'https://json-am.org/context/v0.1',
