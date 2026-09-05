@@ -3,42 +3,83 @@ import url from 'url';
 import { readFileSync } from 'fs';
 import { importSPKI } from 'jose';
 import { verifyCapability } from './middleware/jwt.js';
-import { enforceCapability, sanitizeUri } from './middleware/guardrails.js';
+import { enforceCapability, sanitizeUri, enforceTokenLifetime } from './middleware/guardrails.js';
 import { embed, toVectorLiteral } from './embedding.js';
 import { storeTrace, newTraceUri } from './ingest.js';
 import { PostgresAdapter } from '../adapters/postgres.js';
+import { config, redactedSummary } from './config.js';
+import { makeLogger, newRequestId } from './logger.js';
+import { RateLimiter } from './ratelimit.js';
+import { Audit } from './audit.js';
 
-const PORT = process.env.PORT || 7100;
-const PUBLIC_KEY_PEM = process.env.PUBLIC_KEY || '';
-const PRIVATE_KEY_PEM = process.env.PRIVATE_KEY || '';
-const DATABASE_URL = process.env.DATABASE_URL || '';
-const TRUST_DOMAIN = process.env.TRUST_DOMAIN || '';
-
+const logger = makeLogger(config.logLevel);
 const UI_HTML = readFileSync(new URL('./ui.html', import.meta.url), 'utf8');
 
-// jose's jwtVerify needs a KeyObject for EdDSA, so the raw SPKI PEM supplied
-// via the env var must be imported once at startup. Failure to import must not
-// crash the process, so /health keeps responding for the platform healthcheck.
+// jose's jwtVerify needs a KeyObject for EdDSA; import the SPKI PEM once.
+// A bad key must not crash the process — /health stays up for orchestration.
 let publicKey = null;
-if (PUBLIC_KEY_PEM) {
+if (config.publicKeyPem) {
   try {
-    publicKey = await importSPKI(PUBLIC_KEY_PEM, 'EdDSA');
+    publicKey = await importSPKI(config.publicKeyPem, 'EdDSA');
   } catch (e) {
-    console.error('Failed to import PUBLIC_KEY:', e.message);
+    logger.error('public_key_import_failed', { error: e.message });
   }
 }
 
-// The Pool connects lazily, so an empty/unset DATABASE_URL does not fail boot.
-const adapter = new PostgresAdapter(DATABASE_URL);
+const adapter = new PostgresAdapter(config.databaseUrl, {
+  ssl: config.dbSslConfig,
+  max: config.dbPoolMax,
+  idleTimeoutMillis: config.dbIdleTimeoutMs,
+  connectionTimeoutMillis: config.dbConnectTimeoutMs,
+});
+const audit = new Audit(adapter, logger, { enabled: Boolean(config.databaseUrl) });
+const limiter = new RateLimiter({ rps: config.rateLimitRps, burst: config.rateLimitBurst });
 
-function readJsonBody(req, limitBytes = 1_000_000) {
+for (const w of config.warnings) logger.warn('config_warning', { detail: w });
+if (config.strictBoot && (!publicKey || !config.privateKeyPem || !config.databaseUrl)) {
+  logger.error('strict_boot_failed', { summary: redactedSummary(config) });
+  process.exit(1);
+}
+
+// ---------- helpers ----------
+
+function setSecurityHeaders(res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  if (config.hstsEnabled) res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains');
+}
+
+function sendJson(res, code, obj, extraHeaders = {}) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, { 'Content-Type': 'application/json', ...extraHeaders });
+  res.end(body);
+}
+
+function sendText(res, code, text, extraHeaders = {}) {
+  res.writeHead(code, extraHeaders);
+  res.end(text);
+}
+
+function clientKey(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.length) return xff.split(',')[0].trim();
+  return req.socket?.remoteAddress || 'unknown';
+}
+
+function readJsonBody(req, limitBytes) {
   return new Promise((resolve, reject) => {
     let data = '';
+    let aborted = false;
     req.on('data', (chunk) => {
+      if (aborted) return;
       data += chunk;
-      if (data.length > limitBytes) reject(new Error('Body too large'));
+      if (data.length > limitBytes) {
+        aborted = true;
+        reject(new Error('Body too large'));
+      }
     });
     req.on('end', () => {
+      if (aborted) return;
       if (!data) return resolve({});
       try {
         resolve(JSON.parse(data));
@@ -50,168 +91,254 @@ function readJsonBody(req, limitBytes = 1_000_000) {
   });
 }
 
-// Verify the bearer capability token and enforce it for (uri, action).
-// Returns the JWT payload on success; throws on any failure.
+// Verify the bearer token, enforce capability + lifetime for (uri, action).
 async function authorize(req, uri, action) {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.replace('Bearer ', '');
   if (!token) throw new Error('Missing token');
   if (!publicKey) throw new Error('Server missing PUBLIC_KEY');
   const claims = await verifyCapability(token, publicKey);
+  enforceTokenLifetime(claims, action, {
+    read: config.tokenMaxAgeRead,
+    write: config.tokenMaxAgeWrite,
+  });
   enforceCapability(claims, uri, action);
   return claims;
 }
 
+function domainOf(uri) {
+  const parts = String(uri).split('://');
+  return parts.length > 1 ? parts[1].split('/')[0] : null;
+}
+
+// Rate-limit a request by client key; returns true if it responded with 429.
+function rateLimited(req, res, requestId) {
+  if (!config.rateLimitEnabled) return false;
+  const { allowed, retryAfter } = limiter.take(clientKey(req));
+  if (allowed) return false;
+  logger.warn('rate_limited', { requestId, client: clientKey(req) });
+  sendJson(res, 429, { error: 'Too many requests' }, { 'Retry-After': String(retryAfter) });
+  return true;
+}
+
+function validateTraceInput(body) {
+  const task = body.task ?? null;
+  const content = body.content ?? null;
+  if (task != null && typeof task !== 'string') throw new Error('task must be a string');
+  if (content != null && typeof content !== 'string') throw new Error('content must be a string');
+  if (!task && !content) throw new Error('trace requires task or content');
+  if ((task || '').length + (content || '').length > config.contentMaxLength) {
+    throw new Error('trace content exceeds limit');
+  }
+  let boundContext = body.boundContext ?? [];
+  if (!Array.isArray(boundContext)) throw new Error('boundContext must be an array');
+  if (boundContext.length > config.boundContextMax) throw new Error('boundContext too large');
+  if (!boundContext.every((x) => typeof x === 'string')) throw new Error('boundContext must be strings');
+  return { task, content, boundContext };
+}
+
+// ---------- server ----------
+
 const server = http.createServer(async (req, res) => {
+  const requestId = newRequestId();
+  const started = Date.now();
   const parsed = url.parse(req.url || '', true);
+  const path = parsed.pathname || '';
+  setSecurityHeaders(res);
+  res.setHeader('X-Request-Id', requestId);
+  res.on('finish', () => {
+    logger.info('request', {
+      requestId,
+      method: req.method,
+      path,
+      status: res.statusCode,
+      durationMs: Date.now() - started,
+    });
+  });
 
-  if (parsed.pathname === '/health') {
-    res.writeHead(200);
-    res.end('ok');
-    return;
-  }
+  try {
+    // Liveness — always 200 while the process is up.
+    if (path === '/health') return sendText(res, 200, 'ok');
 
-  // Built-in configuration UI so an operator can confirm the deploy is wired up.
-  if (parsed.pathname === '/' || parsed.pathname === '/ui') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(UI_HTML);
-    return;
-  }
+    // Readiness — 200 only when the server can actually serve requests.
+    if (path === '/ready') {
+      let ready = publicKey !== null;
+      const detail = { publicKey: publicKey !== null, database: false, schema: false };
+      if (config.databaseUrl) {
+        try {
+          const r = await adapter.check();
+          detail.database = r.connected;
+          detail.schema = r.schemaReady;
+          ready = ready && r.connected && r.schemaReady;
+        } catch {
+          ready = false;
+        }
+      }
+      return sendJson(res, ready ? 200 : 503, { ready, ...detail });
+    }
 
-  // Config/readiness diagnostics. Reports booleans only — never secret values.
-  if (parsed.pathname === '/api/status' && req.method === 'GET') {
-    const status = {
-      port: Number(PORT),
-      trustDomain: TRUST_DOMAIN || null,
-      publicKey: { configured: Boolean(PUBLIC_KEY_PEM), valid: publicKey !== null },
-      privateKey: { configured: Boolean(PRIVATE_KEY_PEM) },
-      database: { configured: Boolean(DATABASE_URL), connected: false, schemaReady: false },
-      rag: { ready: false },
-    };
-    if (DATABASE_URL) {
+    // Built-in configuration UI.
+    if (path === '/' || path === '/ui') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(UI_HTML);
+    }
+
+    // Config/readiness diagnostics — booleans only, never secret values.
+    if (path === '/api/status' && req.method === 'GET') {
+      const status = {
+        port: config.port,
+        trustDomain: config.trustDomain || null,
+        publicKey: { configured: Boolean(config.publicKeyPem), valid: publicKey !== null },
+        privateKey: { configured: Boolean(config.privateKeyPem) },
+        database: { configured: Boolean(config.databaseUrl), connected: false, schemaReady: false },
+        rag: { ready: false },
+        audit: { ready: false },
+      };
+      if (config.databaseUrl) {
+        try {
+          const r = await adapter.check();
+          status.database.connected = r.connected;
+          status.database.schemaReady = r.schemaReady;
+          status.rag.ready = r.ragReady;
+          status.audit.ready = r.auditReady;
+        } catch (e) {
+          status.database.error = e.message;
+        }
+      }
+      status.ready =
+        status.publicKey.valid &&
+        status.privateKey.configured &&
+        status.database.connected &&
+        status.database.schemaReady &&
+        status.rag.ready &&
+        status.audit.ready;
+      return sendJson(res, 200, status);
+    }
+
+    // ----- authenticated endpoints (rate-limited) -----
+
+    if (path === '/resolve' && req.method === 'GET') {
+      if (rateLimited(req, res, requestId)) return;
+      let uri;
+      let claims;
       try {
-        const r = await adapter.check();
-        status.database.connected = r.connected;
-        status.database.schemaReady = r.schemaReady;
-        status.rag.ready = r.ragReady;
+        uri = sanitizeUri(parsed.query.uri);
+        claims = await authorize(req, uri, 'read');
       } catch (e) {
-        status.database.error = e.message;
+        audit.record({ action: 'read', uri: parsed.query.uri, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const envelope = await adapter.resolve(uri);
+        audit.record({ actor: claims.sub, action: 'read', uri, trustDomain: domainOf(uri), result: envelope ? 'allow' : 'not_found', requestId });
+        if (!envelope) return sendJson(res, 404, { error: 'Not found', id: uri });
+        return sendJson(res, 200, envelope);
+      } catch (e) {
+        logger.error('resolve_error', { requestId, error: e.message });
+        return sendJson(res, 500, { error: 'Internal error' });
       }
     }
-    status.ready =
-      status.publicKey.valid &&
-      status.privateKey.configured &&
-      status.database.connected &&
-      status.database.schemaReady &&
-      status.rag.ready;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(status));
-    return;
-  }
 
-  // Resolve a JSON-AM envelope by URI (read capability required).
-  if (parsed.pathname === '/resolve' && req.method === 'GET') {
-    let uri;
-    try {
-      uri = sanitizeUri(parsed.query.uri);
-      await authorize(req, uri, 'read');
-    } catch (e) {
-      res.writeHead(403);
-      res.end('Forbidden: ' + e.message);
-      return;
-    }
-    try {
-      const envelope = await adapter.resolve(uri);
-      if (!envelope) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Not found', id: uri }));
-        return;
+    if (path === '/memory' && req.method === 'POST') {
+      if (rateLimited(req, res, requestId)) return;
+      let body;
+      try {
+        body = await readJsonBody(req, config.bodyLimitBytes);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
       }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(envelope));
-    } catch (e) {
-      console.error('resolve error:', e.message);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Internal error' }));
-    }
-    return;
-  }
+      const trustDomain = body.trustDomain || config.trustDomain;
+      if (!trustDomain) return sendJson(res, 400, { error: 'trustDomain not set (body.trustDomain or TRUST_DOMAIN)' });
 
-  // Ingest a reasoning trace: signed JSON-AM trace:// envelope + RAG index entry
-  // (write capability required).
-  if (parsed.pathname === '/memory' && req.method === 'POST') {
-    let body;
-    try {
-      body = await readJsonBody(req);
-    } catch (e) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-      return;
-    }
-    const trustDomain = body.trustDomain || TRUST_DOMAIN;
-    if (!trustDomain) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'trustDomain not set (body.trustDomain or TRUST_DOMAIN)' }));
-      return;
-    }
-    const uri = body.uri ? sanitizeUri(body.uri) : newTraceUri(trustDomain);
-    let claims;
-    try {
-      claims = await authorize(req, uri, 'write');
-    } catch (e) {
-      res.writeHead(403);
-      res.end('Forbidden: ' + e.message);
-      return;
-    }
-    try {
-      const result = await storeTrace(
-        adapter,
-        { uri, trustDomain, subject: claims.sub, privateKeyPem: PRIVATE_KEY_PEM },
-        body
-      );
-      res.writeHead(201, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(result));
-    } catch (e) {
-      console.error('ingest error:', e.message);
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
+      let input;
+      try {
+        input = validateTraceInput(body);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
 
-  // Semantic search over stored memories/traces (read capability required).
-  // Returns JSON-AM pointers ranked by similarity.
-  if (parsed.pathname === '/search' && req.method === 'GET') {
-    const q = parsed.query.q;
-    const domain = parsed.query.domain || TRUST_DOMAIN;
-    const k = Math.min(Number(parsed.query.k) || 5, 50);
-    if (!q) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Missing query parameter q' }));
-      return;
+      const uri = body.uri ? sanitizeUri(body.uri) : newTraceUri(trustDomain);
+      let claims;
+      try {
+        claims = await authorize(req, uri, 'write');
+      } catch (e) {
+        audit.record({ action: 'write', uri, trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const result = await storeTrace(
+          adapter,
+          { uri, trustDomain, subject: claims.sub, privateKeyPem: config.privateKeyPem },
+          input
+        );
+        audit.record({ actor: claims.sub, action: 'write', uri, trustDomain, result: 'allow', requestId });
+        return sendJson(res, 201, result);
+      } catch (e) {
+        logger.error('ingest_error', { requestId, error: e.message });
+        audit.record({ actor: claims.sub, action: 'write', uri, trustDomain, result: 'error', requestId, detail: { error: e.message } });
+        return sendJson(res, 400, { error: e.message });
+      }
     }
-    try {
-      await authorize(req, `memory://${domain}/search`, 'read');
-    } catch (e) {
-      res.writeHead(403);
-      res.end('Forbidden: ' + e.message);
-      return;
-    }
-    try {
-      const embedding = toVectorLiteral(await embed(String(q)));
-      const results = await adapter.search({ embedding, k, trustDomain: domain || null });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ query: q, count: results.length, results }));
-    } catch (e) {
-      console.error('search error:', e.message);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Internal error' }));
-    }
-    return;
-  }
 
-  res.writeHead(404);
-  res.end('Not found');
+    if (path === '/search' && req.method === 'GET') {
+      if (rateLimited(req, res, requestId)) return;
+      const q = parsed.query.q;
+      const domain = parsed.query.domain || config.trustDomain;
+      const k = Math.min(Number(parsed.query.k) || 5, config.searchKMax);
+      if (!q) return sendJson(res, 400, { error: 'Missing query parameter q' });
+      let claims;
+      try {
+        claims = await authorize(req, `memory://${domain}/search`, 'read');
+      } catch (e) {
+        audit.record({ action: 'search', trustDomain: domain, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const embedding = toVectorLiteral(await embed(String(q)));
+        const results = await adapter.search({ embedding, k, trustDomain: domain || null });
+        audit.record({ actor: claims.sub, action: 'search', trustDomain: domain, result: 'allow', requestId, detail: { q: String(q), k, hits: results.length } });
+        return sendJson(res, 200, { query: q, count: results.length, results });
+      } catch (e) {
+        logger.error('search_error', { requestId, error: e.message });
+        return sendJson(res, 500, { error: 'Internal error' });
+      }
+    }
+
+    return sendText(res, 404, 'Not found');
+  } catch (e) {
+    logger.error('unhandled_request_error', { requestId, error: e.message, stack: e.stack });
+    if (!res.headersSent) sendJson(res, 500, { error: 'Internal error' });
+  }
 });
 
-server.listen(PORT, () => console.log(`CARMA listening on ${PORT}`));
+server.listen(config.port, () => {
+  logger.info('carma_listening', { port: config.port, config: redactedSummary(config) });
+});
+
+// ---------- lifecycle ----------
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info('shutdown_start', { signal });
+  server.close(() => {
+    adapter.close().finally(() => {
+      logger.info('shutdown_complete', {});
+      process.exit(0);
+    });
+  });
+  // Don't hang forever on lingering connections.
+  setTimeout(() => process.exit(1), 10000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('unhandledRejection', (reason) => {
+  logger.error('unhandled_rejection', { error: reason instanceof Error ? reason.message : String(reason) });
+});
+process.on('uncaughtException', (e) => {
+  logger.error('uncaught_exception', { error: e.message, stack: e.stack });
+  process.exit(1);
+});
+
+export { server };

@@ -112,6 +112,11 @@ const STEPS = [
     ok: s => s.rag && s.rag.ready,
     hint: () => 'Enable the <code>vector</code> extension and the <code>embedding</code> column via <code>npm run migrate</code> (needs a pgvector-enabled Postgres).'
   },
+  {
+    key: 'audit', title: 'Audit log (audit_log)',
+    ok: s => s.audit && s.audit.ready,
+    hint: () => 'Create the append-only <code>audit_log</code> table via <code>npm run migrate</code>.'
+  },
 ];
 
 let state = {};
