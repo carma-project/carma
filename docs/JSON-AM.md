@@ -63,6 +63,13 @@ projection used by recall ranking and lifecycle filters: `status`,
 `confidence`, `importance`. These mirror the signed envelope; the envelope
 remains authoritative.
 
+`adapters/migrations/0005_consolidation_tiers.sql` adds a further projection for
+human-like memory management: `tier` (`working` | `consolidated` | `pinned`),
+`reinforcement_count`, and `last_reinforced_at`, plus a `memory_review` table for
+the near-duplicate consolidation review queue. These are **lifecycle state**, not
+envelope content — a memory's signed envelope never changes when it is reinforced,
+promoted, pinned, or reviewed. See "Consolidation & tiers" in `AGENTS.md`.
+
 ## Recall (precedent retrieval)
 
 Recall ranks **active** memories by a blend, not raw cosine similarity, so it

@@ -66,11 +66,36 @@
 - [x] Precedent recall — similarity × outcome × recency ranking over active
       memories; results carry reasoning + decision + outcome + lineage
       (`adapters/postgres.ts`, `server/recall.ts`); weights configurable.
-- [ ] Consolidation on write — dedup/reinforce near-duplicates (reinforcement
-      count, decay), candidate→consolidated→pinned tiers, human review queue.
+- [x] Consolidation on write — near-duplicate detection enqueues a human review
+      (`merge`/`keep_separate`/`reject`) instead of silent merge; reinforcement
+      count feeds recall + tier promotion; `working`→`consolidated`→`pinned`
+      tiers; `POST /pin`, `GET /reviews`, `POST /reviews/resolve`
+      (`adapters/postgres.ts`, `server/ingest.ts`, migration `0005`).
+- [ ] "Dreaming" — offline consolidation job (`npm run dream` / `POST /consolidate`):
+      decay/evict stale `working` memories, batch near-duplicate clustering into the
+      review queue, recompute salience/tier from outcomes.
 - [ ] Episodic→semantic distillation — condense recurring precedents into
       reusable principles; outcome-weighted dataset selection for fine-tuning.
 - [ ] Governed cross-domain (federated) recall.
+
+## Phase 2.9 - Consolidation research (Mem0, arXiv:2504.19413) — planned
+Informed by "Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory".
+- [ ] LLM-assisted consolidation proposal — when a near-duplicate is detected, have the
+      configured (provider-neutral) model classify the operation (ADD / UPDATE / DELETE /
+      NOOP, per Mem0 §2.1) and pre-fill the human review recommendation. Human still decides;
+      CARMA keeps append-only + supersede (Mem0^g's "mark invalid, don't delete") for temporal
+      reasoning rather than physical deletion.
+- [ ] Extraction / gisting — condense verbose episodic traces into concise semantic
+      memories for cheap recall (Mem0 stores ~7k tokens/conversation vs ~26k full-context;
+      ~90% token + ~91% p95 latency savings). Recall a gist, resolve the full envelope on demand.
+      This is the mechanism behind episodic→semantic distillation above.
+- [ ] Async summary refresh — background per-domain summary that provides global context to
+      extraction/consolidation without blocking the write path (Mem0's async summary module).
+- [ ] Optional relationship/graph layer — evolve `boundContext`/`lineage` into a
+      (decision)-[informed_by]->(precedent), (decision)-[produced]->(outcome) graph for
+      multi-hop/temporal precedent queries (Mem0^g helped most on temporal/open-domain).
+- [ ] Eval harness — LLM-as-judge recall-quality eval (LOCOMO-style) to measure precedent
+      recall accuracy vs. token/latency cost as weights and consolidation policy change.
 
 ## Phase 3 - Ecosystem
 - [ ] Federation via ANS

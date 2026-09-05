@@ -50,6 +50,14 @@ Production/hardening:
   `SEARCH_K_MAX` (`50`) — input limits.
 - `RECALL_W_SIM` (`1.0`) / `RECALL_W_OUTCOME` (`0.4`) / `RECALL_W_RECENCY` (`0.15`) /
   `RECALL_HALF_LIFE_DAYS` (`30`) — precedent-recall ranking blend (similarity × outcome × recency).
+- `RECALL_PINNED_BOOST` (`0.1`) / `RECALL_W_REINFORCE` (`0.05`) — recall boosts for pinned memories
+  and for memories that have been reinforced (recalled/merged) repeatedly.
+- `CONSOLIDATE_SIM_THRESHOLD` (`0.92`) — on write, a candidate within this cosine similarity of an
+  existing memory enqueues a human consolidation review instead of silently merging.
+- `TIER_CONSOLIDATE_MIN_CONFIDENCE` (`0.8`) / `TIER_CONSOLIDATE_MIN_IMPORTANCE` (`0.7`) — thresholds
+  above which a new memory is admitted directly to the `consolidated` tier (else `working`).
+- `REINFORCE_PROMOTE_AT` (`3`) — reinforcement count at which a `working` memory auto-promotes to
+  `consolidated`.
 - `LOG_LEVEL` (`info`) — structured JSON logs; each request gets an `X-Request-Id`.
 - `HSTS_ENABLED` (`false`) — send HSTS (enable when TLS terminates at/after the proxy).
 - `STRICT_BOOT` (`false`) — fail fast at startup if `PUBLIC_KEY`/`PRIVATE_KEY`/`DATABASE_URL`
@@ -75,6 +83,13 @@ Production/hardening:
 - `POST /retract` — exclude a memory from recall, preserved for audit (write). Body: `{ uri, reason? }`.
 - `GET /search?q=...&k=5&domain=acme` — precedent recall (read): returns precedents (reasoning,
   decision, outcome, lineage) ranked by similarity × outcome × recency; excludes superseded/retracted.
+- `POST /pin` — pin/unpin a memory (write). Body: `{ uri, pinned? }` (default `true`). Pinned
+  memories are boosted in recall and exempt from decay/eviction (see Consolidation & tiers).
+- `GET /reviews?domain=acme&status=pending` — list consolidation reviews (near-duplicate merge
+  decisions) awaiting a human call (read).
+- `POST /reviews/resolve` — resolve a review (write). Body: `{ reviewId, resolution }` where
+  `resolution` is `merge` (reinforce the kept memory), `keep_separate` (both stay), or `reject`
+  (retract the candidate).
 - `POST /distill` — distill stored reasoning/memory into a fine-tune job (capability action
   `distill`). Body: `{ trustDomain?, kind?, since?, limit?, format?, baseModel?, suffix? }`.
   Returns `{ datasetUri, examples, provider, baseModel, jobId, status, model }`.
@@ -143,6 +158,29 @@ The full stack (app + pgvector Postgres, migrations auto-applied) runs locally v
 - **Lifecycle**: graceful `SIGTERM`/`SIGINT` shutdown (drain server, close pool); `uncaughtException`
   exits for orchestrator restart; pool `error` handler prevents idle-client crashes.
 - **Migrations**: `npm run migrate` takes a pg advisory lock so concurrent replicas don't race.
+
+## Consolidation & tiers (human-like memory management)
+
+Modeled on how human memory keeps salient material and lets the rest fade. Columns live in
+`agent_memory` (migration `0005`); the review queue is table `memory_review`.
+
+- **Tiers** (`tier` column): `working` (default, decay-eligible), `consolidated` (durable, admitted
+  by confidence/importance thresholds or promoted by reinforcement), `pinned` (human-protected,
+  recall-boosted, never evicted). Set via `POST /pin` and review resolution.
+- **On-write consolidation**: `storeTrace` (`server/ingest.ts`) finds the nearest neighbor; if it is
+  within `CONSOLIDATE_SIM_THRESHOLD` it enqueues a `memory_review` rather than merging silently —
+  a human decides `merge` / `keep_separate` / `reject` via `POST /reviews/resolve`. `merge`
+  reinforces the kept memory (and can auto-promote it at `REINFORCE_PROMOTE_AT`); `reject` retracts
+  the candidate.
+- **Reinforcement** (`reinforcement_count`): recall and merges strengthen a memory; count feeds the
+  recall score (`RECALL_W_REINFORCE`) and tier promotion — the analog of memories strengthening on
+  use and decaying when unused.
+- **Recall weighting**: `PostgresAdapter.search` blends similarity × outcome × recency × reinforce ×
+  pinned-boost, and filters out `superseded`/`retracted` memories.
+- **"Dreaming" (planned)**: an offline batch counterpart to on-write consolidation — decay/evict
+  stale `working` memories, cluster near-duplicates into the review queue, recompute salience from
+  outcomes, and abstract recurring episodic decisions into semantic memories (feeds distillation).
+  Tracked in `docs/ROADMAP.md`.
 
 ## Cursor Cloud specific instructions
 
