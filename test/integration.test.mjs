@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPair, exportPKCS8 } from 'jose';
 import { PostgresAdapter } from '../adapters/postgres.js';
-import { storeTrace, newTraceUri } from '../server/ingest.js';
+import { storeTrace, newTraceUri, recordOutcome, retractMemory } from '../server/ingest.js';
 import { localEmbed, toVectorLiteral } from '../server/embedding.js';
 import { runDistillation } from '../server/distill/pipeline.js';
 import os from 'os';
@@ -106,6 +106,85 @@ test(
       assert.equal(ex.messages[0].role, 'system');
       assert.equal(ex.messages[1].role, 'user');
       assert.equal(ex.messages[2].role, 'assistant');
+    } finally {
+      await adapter.close();
+    }
+  }
+);
+
+test(
+  'Precedent recall: outcome-weighted ranking, supersession, retraction, outcome record',
+  { skip: DB ? false : 'DATABASE_URL not set' },
+  async () => {
+    const { privateKey } = await generateKeyPair('EdDSA', { crv: 'Ed25519', extractable: true });
+    const pkcs8 = await exportPKCS8(privateKey);
+    const adapter = new PostgresAdapter(DB);
+    const q = toVectorLiteral(localEmbed('exploit an unauthenticated redis instance for rce'));
+    try {
+      // --- Outcome-weighted ranking: two equally-similar decisions, opposite outcomes.
+      const dom = 'recall-' + Date.now();
+      const text = 'exploit unauthenticated redis on 6379 via module load for RCE';
+      const okUri = newTraceUri(dom);
+      const badUri = newTraceUri(dom);
+      // success stored first (older); failure stored second (newer) so recency
+      // favors the failure — outcome weighting must still surface success first.
+      await storeTrace(adapter, { uri: okUri, trustDomain: dom, subject: 't', privateKeyPem: pkcs8 },
+        { task: 'exploit redis', content: text, decision: { choice: 'module load RCE' }, outcome: { status: 'success' } });
+      await storeTrace(adapter, { uri: badUri, trustDomain: dom, subject: 't', privateKeyPem: pkcs8 },
+        { task: 'exploit redis', content: text, decision: { choice: 'module load RCE' }, outcome: { status: 'failure' } });
+
+      const ranked = await adapter.search({ embedding: q, k: 5, trustDomain: dom });
+      assert.equal(ranked[0].uri, okUri, 'successful precedent should rank first');
+      assert.equal(ranked[0].outcome_status, 'success');
+      assert.ok(Number(ranked[0].score) > Number(ranked[1].score));
+
+      // --- Supersession: a revision replaces the prior version in recall.
+      const supDom = 'sup-' + Date.now();
+      const v1 = newTraceUri(supDom);
+      await storeTrace(adapter, { uri: v1, trustDomain: supDom, subject: 't', privateKeyPem: pkcs8 },
+        { task: 'redis fix', content: 'recommend disabling redis entirely' });
+      const v2 = newTraceUri(supDom);
+      await storeTrace(adapter, { uri: v2, trustDomain: supDom, subject: 't', privateKeyPem: pkcs8 },
+        { task: 'redis fix', content: 'recommend requiring AUTH and firewalling 6379', supersedes: v1 });
+
+      const supHits = await adapter.search({ embedding: toVectorLiteral(localEmbed('how to fix redis')), k: 10, trustDomain: supDom });
+      const supUris = supHits.map((r) => r.uri);
+      assert.ok(supUris.includes(v2), 'head revision is recalled');
+      assert.ok(!supUris.includes(v1), 'superseded version is excluded from recall');
+      const oldRow = await adapter.query('SELECT status, superseded_by FROM agent_memory WHERE uri=$1', [v1]);
+      assert.equal(oldRow.rows[0].status, 'superseded');
+      assert.equal(oldRow.rows[0].superseded_by, v2);
+      // The new envelope records the backward lineage link.
+      const v2env = await adapter.resolve(v2);
+      assert.equal(v2env.envelope.lineage.supersedes, v1);
+
+      // --- Retraction: excluded from recall, preserved in the store.
+      const retDom = 'ret-' + Date.now();
+      const r1 = newTraceUri(retDom);
+      await storeTrace(adapter, { uri: r1, trustDomain: retDom, subject: 't', privateKeyPem: pkcs8 },
+        { task: 'finding', content: 'critical RCE on host X' });
+      await retractMemory(adapter, { trustDomain: retDom }, r1);
+      const retHits = await adapter.search({ embedding: toVectorLiteral(localEmbed('critical RCE host')), k: 5, trustDomain: retDom });
+      assert.ok(!retHits.map((r) => r.uri).includes(r1), 'retracted memory is excluded from recall');
+      const retRow = await adapter.query('SELECT status FROM agent_memory WHERE uri=$1', [r1]);
+      assert.equal(retRow.rows[0].status, 'retracted');
+      assert.ok(await adapter.resolve(r1), 'retracted memory still resolvable for audit');
+
+      // --- recordOutcome: signed Outcome envelope + denormalized columns for recall.
+      const oDom = 'outcome-' + Date.now();
+      const dUri = newTraceUri(oDom);
+      await storeTrace(adapter, { uri: dUri, trustDomain: oDom, subject: 't', privateKeyPem: pkcs8 },
+        { task: 'try payload', content: 'attempt SSTI on the profile field' });
+      const rec = await recordOutcome(adapter, { trustDomain: oDom, subject: 't', privateKeyPem: pkcs8 },
+        { decisionUri: dUri, status: 'success', score: 0.9, evidence: 'got code execution' });
+      const dRow = await adapter.query('SELECT outcome_status, outcome_score, outcome_uri FROM agent_memory WHERE uri=$1', [dUri]);
+      assert.equal(dRow.rows[0].outcome_status, 'success');
+      assert.ok(Number(dRow.rows[0].outcome_score) > 0.8);
+      assert.equal(dRow.rows[0].outcome_uri, rec.outcomeUri);
+      const oEnv = await adapter.resolve(rec.outcomeUri);
+      assert.equal(oEnv.envelope.type, 'Outcome');
+      assert.equal(oEnv.envelope.decisionUri, dUri);
+      assert.ok(oEnv.envelope.signature, 'outcome envelope is signed');
     } finally {
       await adapter.close();
     }
