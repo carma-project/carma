@@ -12,7 +12,8 @@ import { clientIdentity } from './mtls.js';
 import { boundGrant } from './capability_issue.js';
 import { embed, toVectorLiteral } from './embedding.js';
 import { storeTrace, newTraceUri, recordOutcome, retractMemory } from './ingest.js';
-import { toPrecedent, weightsFromConfig, policyFromConfig } from './recall.js';
+import { toPrecedent, weightsFromConfig, policyFromConfig, wakeDefaultsFromConfig } from './recall.js';
+import { composeWake } from './wake/wake.js';
 import { runDistillation, fineTuneStatus } from './distill/pipeline.js';
 import { runDream } from './consolidate/dream.js';
 import { runSource } from './ingest/run.js';
@@ -231,11 +232,33 @@ async function handleMcp(req, res, requestId) {
     if (sid && mcpSessions.delete(sid)) logger.info('mcp_session_close', { sessionId: sid });
   };
 
+  // Compose the wake brief once, up front, so it can ride along on the MCP
+  // `initialize` response as server `instructions`. The harness then reloads the
+  // agent's identity/self on connect — the fix for losing personality to a
+  // context compaction. Best-effort: a failure here must not block the session.
+  let instructions;
+  if (config.mcpWakeInstructions && grant.actions.includes('read')) {
+    try {
+      const wakeDefaults = wakeDefaultsFromConfig(config);
+      const brief = await composeWake(adapter, {
+        trustDomain: config.trustDomain,
+        recent: wakeDefaults.recent,
+        identity: wakeDefaults.identity,
+        recallWeights: weightsFromConfig(config),
+      });
+      if (brief.counts.identity > 0 || brief.counts.recent > 0) instructions = brief.digest;
+    } catch (e) {
+      logger.warn('mcp_wake_instructions_failed', { requestId, error: e.message });
+    }
+  }
+
   const carma = new CARMAMCPServer(adapter, {
     trustDomain: config.trustDomain,
     privateKeyPem: config.privateKeyPem,
     allowedActions: grant.actions,
     recallWeights: weightsFromConfig(config),
+    wake: wakeDefaultsFromConfig(config),
+    instructions,
   });
   await carma.server.connect(transport);
   return transport.handleRequest(req, res);
@@ -367,7 +390,8 @@ const requestHandler = async (req, res) => {
         database: { configured: Boolean(config.databaseUrl), connected: false, schemaReady: false },
         rag: { ready: false },
         audit: { ready: false },
-        mcp: { httpEnabled: config.mcpHttpEnabled, path: config.mcpHttpPath, stdio: true },
+        mcp: { httpEnabled: config.mcpHttpEnabled, path: config.mcpHttpPath, stdio: true, wakeInstructions: config.mcpWakeInstructions },
+        wake: { recent: config.wakeRecent, identity: config.wakeIdentity, relevant: config.wakeRelevant },
         consolidation: { pendingReviews: null },
         ingest: {
           scheduler: config.ingestSchedulerEnabled,
@@ -576,6 +600,49 @@ const requestHandler = async (req, res) => {
         return sendJson(res, 200, { query: q, count: results.length, results });
       } catch (e) {
         logger.error('search_error', { requestId, error: e.message });
+        return sendJson(res, 500, { error: 'Internal error' });
+      }
+    }
+
+    // Wake (session-start priming): compose the agent's durable identity/self
+    // (pinned + semantic principles + agent-specs), its most recent decisions,
+    // and — when a `task` is given — the top precedents for it, into a brief the
+    // agent loads at the start of a session so a context compaction doesn't erase
+    // who it is. Read-only compose (no writes/signing) -> gated on 'read'.
+    if (path === '/wake' && (req.method === 'POST' || req.method === 'GET')) {
+      if (rateLimited(req, res, requestId)) return;
+      let body = {};
+      if (req.method === 'POST') {
+        try {
+          body = await readJsonBody(req, config.bodyLimitBytes);
+        } catch (e) {
+          return sendJson(res, 400, { error: e.message });
+        }
+      }
+      const domain = body.trustDomain || parsed.query.domain || config.trustDomain;
+      if (!domain) return sendJson(res, 400, { error: 'trustDomain not set (body.trustDomain, ?domain, or TRUST_DOMAIN)' });
+      const task = body.task ?? parsed.query.task ?? null;
+      let claims;
+      try {
+        claims = await authorize(req, `memory://${domain}/wake`, 'read');
+      } catch (e) {
+        audit.record({ action: 'wake', trustDomain: domain, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const wakeDefaults = wakeDefaultsFromConfig(config);
+        const payload = await composeWake(adapter, {
+          trustDomain: domain,
+          task,
+          recent: body.recent != null ? Math.min(Number(body.recent), config.searchKMax) : wakeDefaults.recent,
+          identity: body.identity != null ? Math.min(Number(body.identity), config.searchKMax) : wakeDefaults.identity,
+          relevant: body.relevant != null ? Math.min(Number(body.relevant), config.searchKMax) : wakeDefaults.relevant,
+          recallWeights: weightsFromConfig(config),
+        });
+        audit.record({ actor: claims.sub, action: 'wake', trustDomain: domain, result: 'allow', requestId, detail: { task: task ? String(task).slice(0, 80) : null, ...payload.counts, openReviews: payload.openReviews } });
+        return sendJson(res, 200, payload);
+      } catch (e) {
+        logger.error('wake_error', { requestId, error: e.message });
         return sendJson(res, 500, { error: 'Internal error' });
       }
     }

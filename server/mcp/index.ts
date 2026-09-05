@@ -8,6 +8,7 @@ import {
 import { storeTrace, newTraceUri, recordOutcome, retractMemory } from '../ingest.js';
 import { embed, toVectorLiteral } from '../embedding.js';
 import { toPrecedent } from '../recall.js';
+import { composeWake } from '../wake/wake.js';
 
 export interface MCPConfig {
   trustDomain: string;
@@ -20,6 +21,12 @@ export interface MCPConfig {
   // Optional precedent-recall weights (see adapters/postgres.ts). Defaults apply
   // when omitted.
   recallWeights?: { sim?: number; outcome?: number; recency?: number; halfLifeDays?: number };
+  // Wake layer sizes for the `wake` tool / resource (defaults apply when omitted).
+  wake?: { recent?: number; identity?: number; relevant?: number };
+  // Optional text surfaced as the MCP `initialize` `instructions` — used to
+  // carry the agent's wake brief (identity + recent) so a harness reloads its
+  // self on connect. Computed per session before the server is constructed.
+  instructions?: string;
 }
 
 // MCP server exposing CARMA to agents over any MCP transport (stdio for local
@@ -38,11 +45,25 @@ export class CARMAMCPServer {
   constructor(private adapter: any, private config: MCPConfig) {
     this.server = new Server(
       { name: 'carma', version: '0.1.0' },
-      { capabilities: { resources: {}, tools: {} } }
+      {
+        capabilities: { resources: {}, tools: {} },
+        // The wake brief rides along on `initialize` so a harness reloads the
+        // agent's identity/self as soon as it connects (surviving compaction).
+        ...(config.instructions ? { instructions: config.instructions } : {}),
+      }
     );
 
     this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
       resources: [
+        {
+          uri: this.wakeUri(),
+          name: `${this.config.trustDomain} wake brief`,
+          description:
+            'Session-start "wake" brief: the agent\'s durable identity (pinned + semantic ' +
+            'principles + agent-specs) and most recent decisions. Read this at the start of a ' +
+            'session (or after a context compaction) to reload who you are and what you were doing.',
+          mimeType: 'application/json',
+        },
         {
           uri: `memory://${this.config.trustDomain}/*`,
           name: `${this.config.trustDomain} memories`,
@@ -54,6 +75,13 @@ export class CARMAMCPServer {
     this.server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
       if (!this.allows('read')) {
         throw new Error("Permission denied: capability lacks 'read' action");
+      }
+      // The wake brief is a composed view, not a stored envelope.
+      if (req.params.uri === this.wakeUri()) {
+        const payload = await this.wake();
+        return {
+          contents: [{ uri: req.params.uri, mimeType: 'application/json', text: JSON.stringify(payload) }],
+        };
       }
       const row = await this.adapter.resolve(req.params.uri);
       return {
@@ -152,6 +180,23 @@ export class CARMAMCPServer {
             required: ['query'],
           },
         },
+        {
+          name: 'wake',
+          description:
+            'Wake up / reload self at the start of a session (or after a context compaction). Returns the agent\'s durable identity ' +
+            '(human-pinned memories, abstracted principles, and agent-specs), its most recent decisions, and — when a task is given — ' +
+            'the top precedents for it. Use this instead of relying on a summarized context window, so personality and self-understanding persist. ' +
+            'The response includes a ready-to-inject natural-language brief in `digest`.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              task: { type: 'string', description: 'What this session is about, to also surface relevant precedent (optional).' },
+              recent: { type: 'number', description: 'How many recent decisions to include.' },
+              identity: { type: 'number', description: 'How many identity/self memories to include.' },
+              relevant: { type: 'number', description: 'How many task-relevant precedents to include (needs task).' },
+            },
+          },
+        },
       ],
     }));
 
@@ -229,7 +274,38 @@ export class CARMAMCPServer {
           content: [{ type: 'text', text: JSON.stringify({ query: args.query, results }) }],
         };
       }
+      if (name === 'wake') {
+        if (!this.allows('read')) {
+          return {
+            content: [{ type: 'text', text: "Permission denied: capability lacks 'read' action" }],
+            isError: true,
+          };
+        }
+        const payload = await this.wake({
+          task: args.task,
+          recent: args.recent,
+          identity: args.identity,
+          relevant: args.relevant,
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+      }
       throw new Error(`Unknown tool: ${name}`);
+    });
+  }
+
+  private wakeUri(): string {
+    return `memory://${this.config.trustDomain}/wake`;
+  }
+
+  // Compose the wake brief for this session's trust domain (read-only).
+  async wake(opts: { task?: string | null; recent?: number; identity?: number; relevant?: number } = {}) {
+    return composeWake(this.adapter, {
+      trustDomain: this.config.trustDomain,
+      task: opts.task ?? null,
+      recent: opts.recent ?? this.config.wake?.recent,
+      identity: opts.identity ?? this.config.wake?.identity,
+      relevant: opts.relevant ?? this.config.wake?.relevant,
+      recallWeights: this.config.recallWeights,
     });
   }
 }

@@ -83,6 +83,13 @@
 - [x] Episodic→semantic abstraction — recurring precedents on a task condense into a
       reusable principle (`Semantic` envelope, migration additive) that feeds distillation
       (selectable as `kind=semantic`).
+- [x] "Waking up" — session-start priming (`server/wake/wake.ts`, `POST /wake`, MCP `wake` tool +
+      `memory://<domain>/wake` resource): composes the agent's durable identity (pinned + semantic
+      principles + agent-specs), recent decisions, and (with a task) relevant precedent into a
+      `digest`. The MCP `initialize` response carries that brief as server `instructions`
+      (`MCP_WAKE_INSTRUCTIONS`), so a harness reloads the agent's self on connect — the recall
+      counterpart to ingest (acquire) and dream (consolidate), and the fix for a context-window
+      compaction erasing an agent's personality/self-understanding. Read-only compose (no writes).
 - [ ] Outcome-weighted dataset selection for fine-tuning — prefer success/pinned/reinforced,
       exclude retracted/superseded/failure when building the training corpus.
 - [ ] LLM-assisted resolution is currently *proposal-only*; auto-apply high-confidence NOOP/UPDATE

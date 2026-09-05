@@ -157,6 +157,16 @@ export function parseConfig(env = {}) {
     // available for local harnesses via `npm run mcp`.
     mcpHttpEnabled: toBool(env.MCP_HTTP_ENABLED, true),
     mcpHttpPath: env.MCP_HTTP_PATH || '/mcp',
+    // Wake (session-start priming): the recall counterpart to ingest/dream.
+    // Layer sizes for the brief composed at the start of a session (POST /wake,
+    // MCP `wake` tool, and the memory://<domain>/wake resource).
+    wakeRecent: toInt(env.WAKE_RECENT, 5),
+    wakeIdentity: toInt(env.WAKE_IDENTITY, 8),
+    wakeRelevant: toInt(env.WAKE_RELEVANT, 5),
+    // When true, an MCP session's `initialize` response carries the agent's
+    // identity+recent wake brief as server `instructions`, so harnesses reload
+    // the agent's self automatically on connect (surviving context compaction).
+    mcpWakeInstructions: toBool(env.MCP_WAKE_INSTRUCTIONS, true),
     // Capability issuance endpoint (POST /capability): mTLS-gated minting of
     // short-lived, scoped tokens so clients (e.g. Cyberorbit) request access
     // without ever holding the signing key. Fail-closed: off unless enabled.
@@ -301,6 +311,7 @@ export function redactedSummary(cfg) {
     embedDim: cfg.embedDim,
     finetuneProvider: cfg.finetuneProvider,
     mcpHttp: cfg.mcpHttpEnabled ? cfg.mcpHttpPath : false,
+    wake: { recent: cfg.wakeRecent, identity: cfg.wakeIdentity, relevant: cfg.wakeRelevant, mcpInstructions: cfg.mcpWakeInstructions },
     capability: cfg.capabilityEndpointEnabled
       ? { mode: cfg.mtlsMode, tls: cfg.mtlsDirectTls ? 'direct' : 'proxy-or-none', domains: cfg.capabilityDomains, maxActions: cfg.capabilityMaxActions, maxTtlSeconds: cfg.capabilityMaxTtlSeconds, fingerprintPinned: cfg.capabilityTrustedFingerprints.length > 0 }
       : false,
