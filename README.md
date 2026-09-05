@@ -43,7 +43,16 @@ curl -sX POST localhost:7100/memory -H "Authorization: Bearer $TOKEN" \
 curl -s "localhost:7100/search?q=database%20connection&k=5" -H "Authorization: Bearer $TOKEN"
 ```
 
-Agents can instead use the MCP server (`npm run mcp`): tools `store_trace` and `search_memory`.
+### Connect any agent (MCP, provider-neutral)
+
+CARMA speaks the open [Model Context Protocol](https://modelcontextprotocol.io) over **two
+transports**, so any MCP-compatible harness — regardless of framework or model provider — can
+recall and store memory. Tools: `store_trace` and `search_memory`; resources: `memory://<domain>/*`.
+
+- **Local harnesses** (Claude Desktop, Cursor, LangGraph, custom SDK clients): `npm run mcp` (stdio).
+- **Remote harnesses**: MCP Streamable HTTP at `POST /mcp` on the main server. Open a session with
+  an `initialize` carrying a bearer capability token; per-session permissions come from that token
+  (`read` for search/resource reads, `write` for `store_trace`).
 
 ### Distill your reasoning into a hostable model
 
@@ -67,11 +76,12 @@ See [`docs/DISTILLATION.md`](docs/DISTILLATION.md).
 - `POST /memory` — ingest a trace (write) · `GET /search?q=` — semantic search (read)
 - `GET /resolve?uri=` — resolve an envelope (read)
 - `POST /distill` — distill reasoning into a fine-tune job (distill) · `GET /finetune?jobId=` — job status (read)
+- `POST /mcp` — MCP Streamable HTTP transport for remote agent harnesses (capability-gated)
 
 ## Scripts
 - `npm run dev` / `npm start` — run the HTTP server
 - `npm run migrate` — apply Postgres migrations (pgvector)
-- `npm run mcp` — run the MCP server (stdio)
+- `npm run mcp` — run the MCP server over stdio (HTTP transport is served at `/mcp` by `npm start`)
 - `npm run mint-token` — issue a capability token
 - `npm run distill` — distill reasoning/memory into a fine-tune job
 - `npm test` — unit + integration + MCP tests

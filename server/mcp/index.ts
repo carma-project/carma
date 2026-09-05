@@ -11,14 +11,25 @@ import { embed, toVectorLiteral } from '../embedding.js';
 export interface MCPConfig {
   trustDomain: string;
   privateKeyPem: string;
+  // Actions this session is permitted to perform. When omitted (e.g. a trusted
+  // local stdio channel) all actions are allowed. For remote HTTP sessions this
+  // is derived from the caller's capability token so the same governance model
+  // applies across transports.
+  allowedActions?: string[];
 }
 
-// MCP server exposing CARMA to agents. A stdio connection is treated as a
-// trusted local channel (as MCP integrations typically are), so tools operate
-// under the configured trust domain and sign envelopes with PRIVATE_KEY. The
-// HTTP API remains JWT-capability gated for untrusted callers.
+// MCP server exposing CARMA to agents over any MCP transport (stdio for local
+// harnesses, Streamable HTTP for remote ones). A stdio connection is treated as
+// a trusted local channel (as MCP integrations typically are), so tools operate
+// under the configured trust domain and sign envelopes with PRIVATE_KEY. Remote
+// HTTP sessions are capability-token gated and carry allowedActions.
 export class CARMAMCPServer {
   server: Server;
+
+  private allows(action: string): boolean {
+    const allowed = this.config.allowedActions;
+    return !allowed || allowed.includes(action);
+  }
 
   constructor(private adapter: any, private config: MCPConfig) {
     this.server = new Server(
@@ -37,6 +48,9 @@ export class CARMAMCPServer {
     }));
 
     this.server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
+      if (!this.allows('read')) {
+        throw new Error("Permission denied: capability lacks 'read' action");
+      }
       const row = await this.adapter.resolve(req.params.uri);
       return {
         contents: [
@@ -88,6 +102,12 @@ export class CARMAMCPServer {
     this.server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const { name, arguments: args = {} } = req.params as any;
       if (name === 'store_trace') {
+        if (!this.allows('write')) {
+          return {
+            content: [{ type: 'text', text: "Permission denied: capability lacks 'write' action" }],
+            isError: true,
+          };
+        }
         const uri = newTraceUri(this.config.trustDomain);
         const result = await storeTrace(
           this.adapter,
@@ -102,6 +122,12 @@ export class CARMAMCPServer {
         return { content: [{ type: 'text', text: JSON.stringify(result) }] };
       }
       if (name === 'search_memory') {
+        if (!this.allows('read')) {
+          return {
+            content: [{ type: 'text', text: "Permission denied: capability lacks 'read' action" }],
+            isError: true,
+          };
+        }
         const embedding = toVectorLiteral(await embed(String(args.query ?? '')));
         const results = await this.adapter.search({
           embedding,

@@ -28,7 +28,9 @@
 
 ## 4. Transport
 - **[planned]** TLS 1.3 mandatory (terminate at the platform/proxy in front of CARMA)
-- **[partial]** MCP over stdio (trusted local) today; TLS WebSocket transport planned
+- **[done]** MCP over stdio (trusted local) and Streamable HTTP (`POST /mcp`); HTTP sessions
+  require a bearer capability token and enforce per-session actions (read/write). Terminate TLS
+  at the platform/proxy in front of the HTTP transport.
 - **[done]** HSTS available via `HSTS_ENABLED`; no secrets in URLs (tokens are headers only)
 
 ## 5. Auditing

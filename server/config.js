@@ -46,6 +46,11 @@ export function parseConfig(env = {}) {
     distillOutputDir: env.DISTILL_OUTPUT_DIR || '/tmp/carma-datasets',
     distillMaxExamples: toInt(env.DISTILL_MAX_EXAMPLES, 50000),
     distillSystemPrompt: env.DISTILL_SYSTEM_PROMPT || '',
+    // MCP over Streamable HTTP: lets any remote MCP-compatible agent harness
+    // connect for memory recall/ingest at MCP_HTTP_PATH. stdio is always
+    // available for local harnesses via `npm run mcp`.
+    mcpHttpEnabled: toBool(env.MCP_HTTP_ENABLED, true),
+    mcpHttpPath: env.MCP_HTTP_PATH || '/mcp',
     logLevel: (env.LOG_LEVEL || 'info').toLowerCase(),
     hstsEnabled: toBool(env.HSTS_ENABLED, false),
     // If true, boot fails fast when required config is missing/invalid.
@@ -91,6 +96,7 @@ export function redactedSummary(cfg) {
     embeddingProvider: cfg.embeddingProvider,
     embedDim: cfg.embedDim,
     finetuneProvider: cfg.finetuneProvider,
+    mcpHttp: cfg.mcpHttpEnabled ? cfg.mcpHttpPath : false,
     tokenMaxAgeRead: cfg.tokenMaxAgeRead,
     tokenMaxAgeWrite: cfg.tokenMaxAgeWrite,
     rateLimit: cfg.rateLimitEnabled ? { rps: cfg.rateLimitRps, burst: cfg.rateLimitBurst } : false,

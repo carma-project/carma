@@ -13,13 +13,15 @@ are indexed for retrieval. Two ingress paths share one code path
 
 ## Ingress paths
 
-### MCP (agents / Claude, etc.)
-- Run the CARMA MCP server: `npm run mcp` (stdio).
+### MCP (any agent harness — provider-neutral)
+- **stdio:** run the CARMA MCP server with `npm run mcp` (local harnesses).
+- **Streamable HTTP:** `POST /mcp` on the main server (remote harnesses); open a session with an
+  authenticated `initialize` (bearer capability token). Connect with any MCP Streamable HTTP client.
 - Tool `store_trace({ task, content, boundContext })` → returns the memory
-  pointer (`trace://<domain>/...`).
-- Tool `search_memory({ query, k })` → JSON-AM pointers ranked by similarity.
-- A stdio connection is treated as a trusted local channel; tools operate under
-  `TRUST_DOMAIN` and sign with `PRIVATE_KEY`.
+  pointer (`trace://<domain>/...`). Requires `write`.
+- Tool `search_memory({ query, k })` → JSON-AM pointers ranked by similarity. Requires `read`.
+- A stdio connection is a trusted local channel (all actions); HTTP sessions carry the token's
+  actions. Both operate under `TRUST_DOMAIN` and sign with `PRIVATE_KEY`.
 
 ### HTTP (capability-gated)
 - `POST /memory` with a `write` capability token → stores a trace, returns the

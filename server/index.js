@@ -1,12 +1,15 @@
 import http from 'http';
 import url from 'url';
 import { readFileSync } from 'fs';
+import { randomUUID } from 'crypto';
 import { importSPKI } from 'jose';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { verifyCapability } from './middleware/jwt.js';
 import { enforceCapability, sanitizeUri, enforceTokenLifetime } from './middleware/guardrails.js';
 import { embed, toVectorLiteral } from './embedding.js';
 import { storeTrace, newTraceUri } from './ingest.js';
 import { runDistillation, fineTuneStatus } from './distill/pipeline.js';
+import { CARMAMCPServer } from './mcp/index.js';
 import { PostgresAdapter } from '../adapters/postgres.js';
 import { config, redactedSummary } from './config.js';
 import { makeLogger, newRequestId } from './logger.js';
@@ -122,6 +125,73 @@ function rateLimited(req, res, requestId) {
   return true;
 }
 
+// ---------- MCP over Streamable HTTP ----------
+// Any MCP-compatible agent harness (local or remote) can connect here for
+// memory recall/ingest. Sessions are opened by an initialize POST carrying a
+// capability token; per-session tool permissions are derived from that token,
+// so the same governance model applies as the REST API. CARMA is not tied to
+// any single agent framework or model provider — it speaks the open protocol.
+const mcpSessions = new Map(); // sessionId -> StreamableHTTPServerTransport
+
+async function authorizeMcp(req) {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  if (!token) throw new Error('Missing token');
+  if (!publicKey) throw new Error('Server missing PUBLIC_KEY');
+  if (!config.trustDomain) throw new Error('Server missing TRUST_DOMAIN');
+  const claims = await verifyCapability(token, publicKey);
+  enforceTokenLifetime(claims, 'read', {
+    read: config.tokenMaxAgeRead,
+    write: config.tokenMaxAgeWrite,
+  });
+  // A session requires at least read on this trust domain; store_trace is
+  // additionally gated on 'write' inside the MCP server via allowedActions.
+  enforceCapability(claims, `memory://${config.trustDomain}/mcp`, 'read');
+  const actions = (claims.jsonam && claims.jsonam.actions) || [];
+  return { sub: claims.sub, actions };
+}
+
+async function handleMcp(req, res, requestId) {
+  const sessionId = req.headers['mcp-session-id'];
+  const existing = typeof sessionId === 'string' ? mcpSessions.get(sessionId) : undefined;
+  if (existing) return existing.handleRequest(req, res);
+
+  // No session yet — only an initialize POST may open one, and it must be
+  // authenticated. GET/DELETE without a valid session id are rejected.
+  if (req.method !== 'POST') {
+    return sendJson(res, 400, { error: 'Missing or unknown mcp-session-id' });
+  }
+
+  let grant;
+  try {
+    grant = await authorizeMcp(req);
+  } catch (e) {
+    audit.record({ action: 'mcp_connect', result: 'deny', requestId, detail: { reason: e.message } });
+    res.setHeader('WWW-Authenticate', 'Bearer');
+    return sendJson(res, 401, { error: 'Unauthorized: ' + e.message });
+  }
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (sid) => {
+      mcpSessions.set(sid, transport);
+      logger.info('mcp_session_open', { requestId, sessionId: sid, actor: grant.sub });
+      audit.record({ actor: grant.sub, action: 'mcp_connect', result: 'allow', requestId, detail: { sessionId: sid, actions: grant.actions } });
+    },
+  });
+  transport.onclose = () => {
+    const sid = transport.sessionId;
+    if (sid && mcpSessions.delete(sid)) logger.info('mcp_session_close', { sessionId: sid });
+  };
+
+  const carma = new CARMAMCPServer(adapter, {
+    trustDomain: config.trustDomain,
+    privateKeyPem: config.privateKeyPem,
+    allowedActions: grant.actions,
+  });
+  await carma.server.connect(transport);
+  return transport.handleRequest(req, res);
+}
+
 function validateTraceInput(body) {
   const task = body.task ?? null;
   const content = body.content ?? null;
@@ -178,6 +248,11 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, ready ? 200 : 503, { ready, ...detail });
     }
 
+    // MCP over Streamable HTTP — harness-agnostic memory recall/ingest.
+    if (config.mcpHttpEnabled && path === config.mcpHttpPath) {
+      return handleMcp(req, res, requestId);
+    }
+
     // Built-in configuration UI.
     if (path === '/' || path === '/ui') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -194,6 +269,7 @@ const server = http.createServer(async (req, res) => {
         database: { configured: Boolean(config.databaseUrl), connected: false, schemaReady: false },
         rag: { ready: false },
         audit: { ready: false },
+        mcp: { httpEnabled: config.mcpHttpEnabled, path: config.mcpHttpPath, stdio: true },
       };
       if (config.databaseUrl) {
         try {

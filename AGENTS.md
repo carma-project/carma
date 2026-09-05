@@ -52,6 +52,8 @@ Production/hardening:
 - `HSTS_ENABLED` (`false`) — send HSTS (enable when TLS terminates at/after the proxy).
 - `STRICT_BOOT` (`false`) — fail fast at startup if `PUBLIC_KEY`/`PRIVATE_KEY`/`DATABASE_URL`
   are missing (recommended in production).
+- `MCP_HTTP_ENABLED` (default `true`) / `MCP_HTTP_PATH` (default `/mcp`) — expose the MCP
+  Streamable HTTP transport on the main server so remote agent harnesses can connect.
 
 ## Endpoints
 
@@ -70,13 +72,25 @@ Production/hardening:
   `distill`). Body: `{ trustDomain?, kind?, since?, limit?, format?, baseModel?, suffix? }`.
   Returns `{ datasetUri, examples, provider, baseModel, jobId, status, model }`.
 - `GET /finetune?jobId=...` — fine-tune job status via the configured provider (read capability).
+- `POST/GET/DELETE /mcp` — MCP Streamable HTTP transport for remote agent harnesses (see MCP
+  section). `initialize` requires a bearer capability token; per-session actions come from it.
 
-## MCP
+## MCP (harness-agnostic)
 
-`server/mcp/` exposes CARMA to agents. Tools: `store_trace({ task, content, boundContext })`
-and `search_memory({ query, k })`; plus resource reads. A stdio connection is treated as a
-trusted local channel (operates under `TRUST_DOMAIN`, signs with `PRIVATE_KEY`). The HTTP API
-stays capability-gated.
+`server/mcp/` exposes CARMA to any MCP-compatible agent harness over two transports —
+CARMA is not tied to a specific framework or model provider, it speaks the open protocol.
+Tools: `store_trace({ task, content, boundContext })` and `search_memory({ query, k })`;
+plus resource reads (`memory://<domain>/*`).
+
+- **stdio** (`npm run mcp`) — for local harnesses (Claude Desktop, Cursor, LangGraph, custom
+  SDK clients). A stdio connection is a trusted local channel: it operates under `TRUST_DOMAIN`,
+  signs with `PRIVATE_KEY`, and has all actions.
+- **Streamable HTTP** (`POST/GET/DELETE {MCP_HTTP_PATH}`, default `/mcp`, on the main server) —
+  for remote/networked harnesses. A session is opened by an authenticated `initialize` (bearer
+  capability token in `Authorization`). Per-session tool permissions are derived from the token's
+  `jsonam.actions`: `search_memory`/resource reads need `read`, `store_trace` needs `write`.
+  Denials return an MCP `isError` result rather than crashing the client. Connect with the MCP
+  SDK's `StreamableHTTPClientTransport` (or any client that speaks MCP Streamable HTTP).
 
 ## Testing
 

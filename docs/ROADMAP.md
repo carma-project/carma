@@ -15,7 +15,9 @@
       `npm run mint-token` CLI. (A full mTLS-gated `POST /capability` refresh
       endpoint per docs/SECURITY.md is still future work.)
 - [x] MCP server implementation — `store_trace` / `search_memory` tools and
-      Postgres-backed resource reads over stdio (`server/mcp/`).
+      Postgres-backed resource reads over **stdio and Streamable HTTP**
+      (`server/mcp/`, `POST /mcp`). Provider/harness-agnostic; HTTP sessions are
+      capability-token gated with per-session action enforcement.
 - [x] Tests and CI — unit + integration + MCP tests (`npm test`) and a GitHub
       Actions workflow with a pgvector service.
 

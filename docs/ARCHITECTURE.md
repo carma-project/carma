@@ -6,7 +6,8 @@
 - URI Resolver: parses scheme and trust domain
 - Ingest: build → sign → embed → persist (`server/ingest.ts`)
 - RAG index: pgvector embeddings + cosine search (`server/embedding.ts`, `adapters/postgres.ts`)
-- MCP server: `store_trace`, `search_memory`, resource reads (`server/mcp/`)
+- MCP server: `store_trace`, `search_memory`, resource reads over stdio + Streamable HTTP
+  (`server/mcp/`, `POST /mcp`) — harness/provider-agnostic, capability-gated on HTTP
 - Adapters: Postgres (Markdown, File future)
 - Federation Layer: ANS/DNS-AID (future)
 
@@ -18,7 +19,7 @@
 5. Return JSON-AM envelope(s)
 
 ## Write data flow (`/memory`, MCP `store_trace`)
-1. Caller submits a trace (HTTP `write` token, or trusted MCP stdio)
+1. Caller submits a trace (HTTP `write` token, MCP HTTP session with `write`, or trusted MCP stdio)
 2. Build a `trace://` JSON-AM envelope with provenance
 3. Sign the envelope (Ed25519 JWS) and validate guardrails
 4. Embed the trace text
