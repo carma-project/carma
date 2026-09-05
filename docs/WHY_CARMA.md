@@ -49,8 +49,13 @@ authorization, and provenance is a liability. CARMA makes those first-class:
 ### 4. Reasoning traces become reusable capital
 Stored traces are retrievable by meaning (RAG), so agents build on prior
 reasoning, institutional knowledge accrues, and traces can later be **distilled**
-into cheaper specialized models. Interaction history stops being exhaust and
-becomes retrieval and training capital.
+into a cheaper specialized model **you host**. CARMA ships a distillation
+pipeline (`docs/DISTILLATION.md`) that turns your signed traces into a fine-tune
+job on a **pluggable model provider** — companies bring their own backend; the
+built-in `fireworks` provider runs Fireworks AI supervised fine-tuning, and an
+offline `local` provider exports the dataset for any other trainer. Interaction
+history stops being exhaust and becomes retrieval **and** training capital that
+never leaves your trust domain.
 
 ### 5. Federation is the longer game
 Cross-domain memory sharing with cryptographic trust (roadmap) enables

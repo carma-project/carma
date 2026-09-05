@@ -10,6 +10,8 @@ Guidance for coding agents working on CARMA (JSON-AM reference implementation).
 - MCP server (stdio): `npm run mcp` (runs `node --import tsx server/mcp/stdio.ts`).
 - Migrations: `npm run migrate` (applies `adapters/migrations/*.sql`, needs pgvector).
 - Mint a capability token: `npm run mint-token -- --domains trust://acme --actions read,write`.
+- Distill -> fine-tune: `npm run distill -- --domain acme --kind trace --base-model <model>`
+  (provider via `FINETUNE_PROVIDER`; `local` default, `fireworks` for hosted SFT).
 - Tests: `npm test` (unit always; integration + MCP tests run only when `DATABASE_URL` is set).
 
 The entrypoint `server/index.js` imports its middleware/adapters with `.js` specifiers, but
@@ -32,6 +34,9 @@ Core:
 - `TRUST_DOMAIN` — default trust domain for ingest/search when not supplied per-request.
 - `EMBEDDING_PROVIDER` (default `local`, deterministic, no network) / `EMBED_DIM` (default `256`,
   must match the `vector(N)` column).
+- `FINETUNE_PROVIDER` (`local` default | `fireworks`) + `FIREWORKS_API_KEY` / `FIREWORKS_ACCOUNT_ID` /
+  `FIREWORKS_BASE_MODEL` / `FIREWORKS_BASE_URL`; `DISTILL_OUTPUT_DIR` / `DISTILL_MAX_EXAMPLES` /
+  `DISTILL_SYSTEM_PROMPT` for the distillation pipeline.
 
 Production/hardening:
 - `DATABASE_SSL` — `disable` (default) | `require` (encrypt, don't verify) | `verify` (verify CA).
@@ -61,6 +66,10 @@ Production/hardening:
   (write capability). Body: `{ task?, content, boundContext?, trustDomain?, uri? }`.
 - `GET /search?q=...&k=5&domain=acme` — semantic search; returns JSON-AM pointers + scores
   (read capability).
+- `POST /distill` — distill stored reasoning/memory into a fine-tune job (capability action
+  `distill`). Body: `{ trustDomain?, kind?, since?, limit?, format?, baseModel?, suffix? }`.
+  Returns `{ datasetUri, examples, provider, baseModel, jobId, status, model }`.
+- `GET /finetune?jobId=...` — fine-tune job status via the configured provider (read capability).
 
 ## MCP
 

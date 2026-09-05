@@ -45,17 +45,35 @@ curl -s "localhost:7100/search?q=database%20connection&k=5" -H "Authorization: B
 
 Agents can instead use the MCP server (`npm run mcp`): tools `store_trace` and `search_memory`.
 
+### Distill your reasoning into a hostable model
+
+Turn accumulated traces into a fine-tune job on a pluggable provider (bring your
+own model backend; `fireworks` and an offline `local` provider are built in):
+
+```bash
+# local (offline) provider: exports chat-JSONL + a signed dataset manifest
+npm run distill -- --domain acme --kind trace
+
+# Fireworks AI supervised fine-tuning
+FINETUNE_PROVIDER=fireworks FIREWORKS_API_KEY=... FIREWORKS_ACCOUNT_ID=... \
+  npm run distill -- --domain acme --base-model accounts/fireworks/models/llama-v3p1-8b-instruct
+```
+
+See [`docs/DISTILLATION.md`](docs/DISTILLATION.md).
+
 ## Endpoints
 - `GET /` — configuration/readiness UI · `GET /api/status` — deploy diagnostics
-- `GET /health` — liveness
+- `GET /health` — liveness · `GET /ready` — readiness
 - `POST /memory` — ingest a trace (write) · `GET /search?q=` — semantic search (read)
 - `GET /resolve?uri=` — resolve an envelope (read)
+- `POST /distill` — distill reasoning into a fine-tune job (distill) · `GET /finetune?jobId=` — job status (read)
 
 ## Scripts
 - `npm run dev` / `npm start` — run the HTTP server
 - `npm run migrate` — apply Postgres migrations (pgvector)
 - `npm run mcp` — run the MCP server (stdio)
 - `npm run mint-token` — issue a capability token
+- `npm run distill` — distill reasoning/memory into a fine-tune job
 - `npm test` — unit + integration + MCP tests
 
 ## Sites

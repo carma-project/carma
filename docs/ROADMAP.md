@@ -41,6 +41,17 @@
 - [ ] iss/aud token checks + resource-pattern glob matching
 - [ ] Serve-path signature auto-verification; KMS/Vault-backed keys + rotation
 
+## Phase 2.7 - Distillation & fine-tuning ✓
+- [x] Dataset builder: signed traces -> OpenAI-compatible chat JSONL
+- [x] Pluggable `FineTuneProvider` (bring-your-own model backend)
+- [x] `local` provider (offline export + simulated job) and `fireworks` provider
+      (Fireworks AI SFT: create/upload dataset + launch job + status)
+- [x] `POST /distill` + `GET /finetune` + `npm run distill` CLI
+- [x] Signed, addressable dataset manifest (`memory://.../dataset/...`) with full
+      source-trace provenance; distillation is `distill`-gated and audited
+- [ ] Job lifecycle tracking table + webhooks; auto-deploy of the hosted model
+- [ ] DPO/RFT and eval-set support; external embedding + reranking for selection
+
 ## Phase 3 - Ecosystem
 - [ ] Federation via ANS
 - [ ] Bridge adapters (Markdown, File)
