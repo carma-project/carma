@@ -88,7 +88,12 @@ const STEPS = [
     ok: s => s.publicKey.valid,
     hint: s => s.publicKey.configured
       ? 'PUBLIC_KEY is set but could not be parsed. It must be an <strong>Ed25519 SPKI PEM</strong>.'
-      : 'Set the <code>PUBLIC_KEY</code> env var to your Ed25519 SPKI public key (PEM). Required to verify capability tokens on <code>/resolve</code>.'
+      : 'Set the <code>PUBLIC_KEY</code> env var to your Ed25519 SPKI public key (PEM). Required to verify capability tokens.'
+  },
+  {
+    key: 'privateKey', title: 'Signing key (PRIVATE_KEY)',
+    ok: s => s.privateKey && s.privateKey.configured,
+    hint: () => 'Set the <code>PRIVATE_KEY</code> env var to your Ed25519 PKCS8 private key (PEM). Required to sign stored envelopes on ingest.'
   },
   {
     key: 'db', title: 'Database connection (DATABASE_URL)',
@@ -100,7 +105,12 @@ const STEPS = [
   {
     key: 'schema', title: 'Schema applied (agent_memory)',
     ok: s => s.database.schemaReady,
-    hint: () => 'Apply <code>adapters/postgres-schema.sql</code> to create the <code>agent_memory</code> table.'
+    hint: () => 'Run <code>npm run migrate</code> (or let docker-compose init) to create the <code>agent_memory</code> table.'
+  },
+  {
+    key: 'rag', title: 'RAG index (pgvector)',
+    ok: s => s.rag && s.rag.ready,
+    hint: () => 'Enable the <code>vector</code> extension and the <code>embedding</code> column via <code>npm run migrate</code> (needs a pgvector-enabled Postgres).'
   },
 ];
 
