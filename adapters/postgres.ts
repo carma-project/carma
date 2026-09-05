@@ -111,6 +111,33 @@ export class PostgresAdapter {
     return res.rows;
   }
 
+  // Bulk selection of stored envelopes for distillation/export.
+  async listEnvelopes(opts: { trustDomain?: string | null; kind?: string | null; since?: string | null; limit?: number } = {}) {
+    const params: any[] = [];
+    let where = 'envelope IS NOT NULL';
+    if (opts.trustDomain) {
+      params.push(opts.trustDomain);
+      where += ` AND trust_domain = $${params.length}`;
+    }
+    if (opts.kind) {
+      params.push(opts.kind);
+      where += ` AND kind = $${params.length}`;
+    }
+    if (opts.since) {
+      params.push(opts.since);
+      where += ` AND created_at >= $${params.length}`;
+    }
+    params.push(Math.min(opts.limit ?? 1000, 1_000_000));
+    const query = `
+      SELECT uri, kind, trust_domain, envelope, content, created_at
+      FROM agent_memory
+      WHERE ${where}
+      ORDER BY created_at ASC
+      LIMIT $${params.length}`;
+    const res = await this.pool.query(query, params);
+    return res.rows;
+  }
+
   async create(envelope: any) {
     const query = `INSERT INTO agent_memory (uri, data) VALUES ($1, $2)`;
     await this.pool.query(query, [envelope.id, JSON.stringify(envelope)]);
