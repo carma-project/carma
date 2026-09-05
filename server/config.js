@@ -1,0 +1,164 @@
+// Central, validated configuration. Parsing is a pure function of an env-like
+// object so it can be unit-tested; the module also exports a default config
+// parsed from process.env.
+
+function toInt(value, def) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.trunc(n) : def;
+}
+
+function toFloat(value, def) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : def;
+}
+
+function toBool(value, def = false) {
+  if (value === undefined || value === '') return def;
+  return /^(1|true|yes|on)$/i.test(String(value));
+}
+
+export function parseConfig(env = {}) {
+  const cfg = {
+    port: toInt(env.PORT, 7100),
+    trustDomain: env.TRUST_DOMAIN || '',
+    publicKeyPem: env.PUBLIC_KEY || '',
+    privateKeyPem: env.PRIVATE_KEY || '',
+    databaseUrl: env.DATABASE_URL || '',
+    // 'disable' (default) | 'require' (encrypt, don't verify) | 'verify' (verify CA)
+    databaseSsl: (env.DATABASE_SSL || 'disable').toLowerCase(),
+    dbPoolMax: toInt(env.DB_POOL_MAX, 10),
+    dbIdleTimeoutMs: toInt(env.DB_IDLE_TIMEOUT_MS, 30000),
+    dbConnectTimeoutMs: toInt(env.DB_CONNECT_TIMEOUT_MS, 5000),
+    embeddingProvider: env.EMBEDDING_PROVIDER || 'local',
+    embedDim: toInt(env.EMBED_DIM, 256),
+    // Token lifetime ceilings (seconds), enforced per action. Defaults follow
+    // docs/SECURITY.md: 15 min for write, 60 min for read.
+    tokenMaxAgeRead: toInt(env.TOKEN_MAX_AGE_READ, 3600),
+    tokenMaxAgeWrite: toInt(env.TOKEN_MAX_AGE_WRITE, 900),
+    rateLimitEnabled: toBool(env.RATE_LIMIT_ENABLED, true),
+    rateLimitRps: toInt(env.RATE_LIMIT_RPS, 20),
+    rateLimitBurst: toInt(env.RATE_LIMIT_BURST, 40),
+    bodyLimitBytes: toInt(env.BODY_LIMIT_BYTES, 1_000_000),
+    contentMaxLength: toInt(env.CONTENT_MAX_LENGTH, 100_000),
+    boundContextMax: toInt(env.BOUND_CONTEXT_MAX, 256),
+    searchKMax: toInt(env.SEARCH_K_MAX, 50),
+    // Precedent recall ranking: blend of semantic similarity, outcome signal
+    // (prefer reasoning that worked), and recency decay. See adapters/postgres.ts.
+    recallWSim: toFloat(env.RECALL_W_SIM, 1.0),
+    recallWOutcome: toFloat(env.RECALL_W_OUTCOME, 0.4),
+    recallWRecency: toFloat(env.RECALL_W_RECENCY, 0.15),
+    recallHalfLifeDays: toFloat(env.RECALL_HALF_LIFE_DAYS, 30),
+    // Human-pinned memories get a *slight* boost (not an override).
+    recallPinnedBoost: toFloat(env.RECALL_PINNED_BOOST, 0.1),
+    // Reinforced (recurring) memories surface a little higher; bounded in [0,1).
+    recallWReinforce: toFloat(env.RECALL_W_REINFORCE, 0.05),
+    // Consolidation: on write, a near-duplicate above this cosine similarity is
+    // queued for human review (merge / keep-separate / reject) — never merged
+    // silently.
+    consolidateSimThreshold: toFloat(env.CONSOLIDATE_SIM_THRESHOLD, 0.92),
+    // A new trace enters as 'consolidated' when confident/important enough,
+    // otherwise 'working' (decays unless reinforced/promoted).
+    tierConsolidateMinConfidence: toFloat(env.TIER_CONSOLIDATE_MIN_CONFIDENCE, 0.8),
+    tierConsolidateMinImportance: toFloat(env.TIER_CONSOLIDATE_MIN_IMPORTANCE, 0.7),
+    // Reinforcement count at which a working memory auto-promotes to consolidated.
+    reinforcePromoteAt: toInt(env.REINFORCE_PROMOTE_AT, 3),
+    // Offline consolidation ("dreaming"): batch maintenance run via `npm run dream`
+    // / POST /consolidate. Decays stale working memories, recomputes tiers/salience
+    // from outcomes, batch-detects near-duplicates (into the human review queue with
+    // a model-proposed resolution), and abstracts recurring decisions into semantic
+    // memories that feed distillation.
+    dreamDecayDays: toFloat(env.DREAM_DECAY_DAYS, 30),
+    // A stale working memory is kept (not archived) if it has been reinforced or
+    // recorded a success — only truly unused, unproven memories fade.
+    dreamMinReinforceKeep: toInt(env.DREAM_MIN_REINFORCE_KEEP, 1),
+    // Near-duplicate similarity that raises a review in the batch dedup pass.
+    dreamSimThreshold: toFloat(env.DREAM_SIM_THRESHOLD, 0.92),
+    // Minimum number of decisions on the same task before it is abstracted into a
+    // reusable semantic memory (principle).
+    dreamMinClusterSize: toInt(env.DREAM_MIN_CLUSTER_SIZE, 3),
+    // Cap on the number of near-duplicate reviews / semantic memories a single run
+    // will create, so a dream pass stays bounded.
+    dreamMaxReviews: toInt(env.DREAM_MAX_REVIEWS, 100),
+    dreamMaxAbstractions: toInt(env.DREAM_MAX_ABSTRACTIONS, 50),
+    // Pluggable memory model for consolidation reasoning (proposals + gisting).
+    // 'local' is deterministic and offline (default); 'fireworks' uses an
+    // OpenAI-compatible chat endpoint. Provider-neutral: bring any model backend.
+    memoryModelProvider: (env.MEMORY_MODEL_PROVIDER || 'local').toLowerCase(),
+    memoryModelName: env.MEMORY_MODEL_NAME || 'accounts/fireworks/models/llama-v3p1-8b-instruct',
+    // Distillation / fine-tuning
+    finetuneProvider: (env.FINETUNE_PROVIDER || 'local').toLowerCase(),
+    fireworksApiKey: env.FIREWORKS_API_KEY || '',
+    fireworksAccountId: env.FIREWORKS_ACCOUNT_ID || '',
+    fireworksBaseUrl: env.FIREWORKS_BASE_URL || 'https://api.fireworks.ai',
+    fireworksBaseModel: env.FIREWORKS_BASE_MODEL || 'accounts/fireworks/models/llama-v3p1-8b-instruct',
+    distillOutputDir: env.DISTILL_OUTPUT_DIR || '/tmp/carma-datasets',
+    distillMaxExamples: toInt(env.DISTILL_MAX_EXAMPLES, 50000),
+    distillSystemPrompt: env.DISTILL_SYSTEM_PROMPT || '',
+    // MCP over Streamable HTTP: lets any remote MCP-compatible agent harness
+    // connect for memory recall/ingest at MCP_HTTP_PATH. stdio is always
+    // available for local harnesses via `npm run mcp`.
+    mcpHttpEnabled: toBool(env.MCP_HTTP_ENABLED, true),
+    mcpHttpPath: env.MCP_HTTP_PATH || '/mcp',
+    logLevel: (env.LOG_LEVEL || 'info').toLowerCase(),
+    hstsEnabled: toBool(env.HSTS_ENABLED, false),
+    // If true, boot fails fast when required config is missing/invalid.
+    strictBoot: toBool(env.STRICT_BOOT, false),
+  };
+
+  cfg.warnings = [];
+  if (!cfg.publicKeyPem) cfg.warnings.push('PUBLIC_KEY not set — authenticated endpoints will 403.');
+  if (!cfg.privateKeyPem) cfg.warnings.push('PRIVATE_KEY not set — trace ingest/signing will fail.');
+  if (!cfg.databaseUrl) cfg.warnings.push('DATABASE_URL not set — resolve/ingest/search unavailable.');
+  if (!cfg.trustDomain) cfg.warnings.push('TRUST_DOMAIN not set — ingest/search require an explicit domain.');
+  if (!['disable', 'require', 'verify'].includes(cfg.databaseSsl)) {
+    cfg.warnings.push(`DATABASE_SSL="${cfg.databaseSsl}" invalid; falling back to "disable".`);
+    cfg.databaseSsl = 'disable';
+  }
+  if (cfg.embeddingProvider !== 'local') {
+    cfg.warnings.push(`EMBEDDING_PROVIDER="${cfg.embeddingProvider}" — only "local" is implemented.`);
+  }
+  if (cfg.finetuneProvider === 'fireworks' && (!cfg.fireworksApiKey || !cfg.fireworksAccountId)) {
+    cfg.warnings.push('FINETUNE_PROVIDER=fireworks but FIREWORKS_API_KEY/FIREWORKS_ACCOUNT_ID are not both set.');
+  } else if (!['local', 'fireworks'].includes(cfg.finetuneProvider)) {
+    cfg.warnings.push(`FINETUNE_PROVIDER="${cfg.finetuneProvider}" unknown; supported: local, fireworks.`);
+  }
+  if (!['local', 'fireworks'].includes(cfg.memoryModelProvider)) {
+    cfg.warnings.push(`MEMORY_MODEL_PROVIDER="${cfg.memoryModelProvider}" unknown; supported: local, fireworks. Falling back to local.`);
+    cfg.memoryModelProvider = 'local';
+  }
+  if (cfg.memoryModelProvider === 'fireworks' && !cfg.fireworksApiKey) {
+    cfg.warnings.push('MEMORY_MODEL_PROVIDER=fireworks but FIREWORKS_API_KEY is not set — dream will fall back to local reasoning.');
+  }
+
+  // Node pg SSL config, or false to disable.
+  cfg.dbSslConfig =
+    cfg.databaseSsl === 'disable'
+      ? false
+      : { rejectUnauthorized: cfg.databaseSsl === 'verify' };
+
+  return cfg;
+}
+
+// A copy safe to log: no secret material, only presence booleans.
+export function redactedSummary(cfg) {
+  return {
+    port: cfg.port,
+    trustDomain: cfg.trustDomain || null,
+    publicKey: Boolean(cfg.publicKeyPem),
+    privateKey: Boolean(cfg.privateKeyPem),
+    database: Boolean(cfg.databaseUrl),
+    databaseSsl: cfg.databaseSsl,
+    embeddingProvider: cfg.embeddingProvider,
+    embedDim: cfg.embedDim,
+    finetuneProvider: cfg.finetuneProvider,
+    mcpHttp: cfg.mcpHttpEnabled ? cfg.mcpHttpPath : false,
+    recall: { sim: cfg.recallWSim, outcome: cfg.recallWOutcome, recency: cfg.recallWRecency, halfLifeDays: cfg.recallHalfLifeDays, pinnedBoost: cfg.recallPinnedBoost, reinforce: cfg.recallWReinforce },
+    consolidate: { simThreshold: cfg.consolidateSimThreshold, promoteAt: cfg.reinforcePromoteAt },
+    dream: { decayDays: cfg.dreamDecayDays, simThreshold: cfg.dreamSimThreshold, minCluster: cfg.dreamMinClusterSize, model: cfg.memoryModelProvider },
+    tokenMaxAgeRead: cfg.tokenMaxAgeRead,
+    tokenMaxAgeWrite: cfg.tokenMaxAgeWrite,
+    rateLimit: cfg.rateLimitEnabled ? { rps: cfg.rateLimitRps, burst: cfg.rateLimitBurst } : false,
+  };
+}
+
+export const config = parseConfig(process.env);

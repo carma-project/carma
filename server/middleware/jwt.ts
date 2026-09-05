@@ -1,10 +1,12 @@
-import { jwtVerify, JWTPayload } from 'jose';
+import { jwtVerify, KeyLike } from 'jose';
 
-export async function verifyCapability(token: string, publicKey: Uint8Array) {
+// Verify an EdDSA capability token and return the full JWT payload (including
+// `sub` and the `jsonam` capability claims). Callers use enforceCapability on
+// the returned payload.
+export async function verifyCapability(token: string, publicKey: KeyLike | Uint8Array) {
   const { payload } = await jwtVerify(token, publicKey, {
-    algorithms: ['EdDSA']
+    algorithms: ['EdDSA'],
   });
-  const jsonam = (payload as any).jsonam;
-  if (!jsonam) throw new Error('No jsonam claims');
-  return jsonam;
+  if (!(payload as any).jsonam) throw new Error('No jsonam claims');
+  return payload;
 }

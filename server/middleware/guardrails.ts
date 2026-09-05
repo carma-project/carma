@@ -8,6 +8,21 @@ export function enforceCapability(tokenClaims: any, uri: string, action: string)
   return true;
 }
 
+// Cap token age per action (defence in depth on top of `exp`). A short-lived
+// write token limits blast radius if leaked; reads may live longer.
+export function enforceTokenLifetime(
+  payload: any,
+  action: string,
+  limits: { read: number; write: number }
+) {
+  const iat = payload?.iat;
+  if (typeof iat !== 'number') throw new Error('Token missing iat');
+  const maxAge = action === 'write' ? limits.write : limits.read;
+  const ageSec = Math.floor(Date.now() / 1000) - iat;
+  if (ageSec > maxAge) throw new Error(`Token too old for action '${action}'`);
+  return true;
+}
+
 export function validateEnvelope(envelope: any) {
   if (envelope['@context'] !== 'https://json-am.org/context/v0.1') throw new Error('Invalid context');
   if (!envelope.signature) throw new Error('Missing signature');

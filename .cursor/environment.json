@@ -1,0 +1,17 @@
+{
+  "name": "CARMA",
+  "install": "npm install",
+  "terminals": [
+    {
+      "name": "carma-server",
+      "command": "npm run dev",
+      "description": "CARMA JSON-AM resolver (HTTP) on port 7100. Serves /health and /resolve. Run via tsx so the .js entrypoint can import the TypeScript middleware."
+    }
+  ],
+  "ports": [
+    {
+      "name": "carma-http",
+      "port": 7100
+    }
+  ]
+}
