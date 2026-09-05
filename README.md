@@ -1,6 +1,6 @@
 # CARMA — Context Addressable Reasoning and Memory Architecture
 
-Reference implementation of JSON-AM v0.1.2-draft.
+Reference implementation of JSON-AM v0.1.3-draft.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
@@ -43,16 +43,35 @@ curl -sX POST localhost:7100/memory -H "Authorization: Bearer $TOKEN" \
 curl -s "localhost:7100/search?q=database%20connection&k=5" -H "Authorization: Bearer $TOKEN"
 ```
 
+### Decision memory & precedent recall
+
+Every trace can record the **decision** made and, later, its **outcome**; knowledge can be
+**revised** (`supersedes`) or **retracted**. Recall then returns *precedents* — the reasoning, the
+choice, and how it turned out — ranked by a blend of semantic similarity, outcome signal (reasoning
+that *worked* resurfaces), and recency, over the accumulated corpus of all decisions. Superseded and
+retracted memories are excluded from recall but preserved for audit and lineage. Schema:
+JSON-AM v0.1.3-draft ([`docs/JSON-AM.md`](docs/JSON-AM.md)).
+
+```bash
+# store a decision, then record how it turned out; recall prefers what worked
+URI=$(curl -sX POST localhost:7100/memory -H "Authorization: Bearer $TOKEN" \
+  -d '{"task":"exploit redis","content":"unauth redis on 6379","decision":{"choice":"module-load RCE"}}' | jq -r .uri)
+curl -sX POST localhost:7100/outcome -H "Authorization: Bearer $TOKEN" \
+  -d "{\"decisionUri\":\"$URI\",\"status\":\"success\",\"score\":0.9,\"evidence\":\"got code exec\"}"
+curl -s "localhost:7100/search?q=redis%20rce&k=5" -H "Authorization: Bearer $TOKEN"
+```
+
 ### Connect any agent (MCP, provider-neutral)
 
 CARMA speaks the open [Model Context Protocol](https://modelcontextprotocol.io) over **two
 transports**, so any MCP-compatible harness — regardless of framework or model provider — can
-recall and store memory. Tools: `store_trace` and `search_memory`; resources: `memory://<domain>/*`.
+recall and store memory. Tools: `store_trace`, `record_outcome`, `retract_memory`, `search_memory`;
+resources: `memory://<domain>/*`.
 
 - **Local harnesses** (Claude Desktop, Cursor, LangGraph, custom SDK clients): `npm run mcp` (stdio).
 - **Remote harnesses**: MCP Streamable HTTP at `POST /mcp` on the main server. Open a session with
   an `initialize` carrying a bearer capability token; per-session permissions come from that token
-  (`read` for search/resource reads, `write` for `store_trace`).
+  (`read` for search/resource reads, `write` for `store_trace`/`record_outcome`/`retract_memory`).
 
 ### Distill your reasoning into a hostable model
 
@@ -73,7 +92,8 @@ See [`docs/DISTILLATION.md`](docs/DISTILLATION.md).
 ## Endpoints
 - `GET /` — configuration/readiness UI · `GET /api/status` — deploy diagnostics
 - `GET /health` — liveness · `GET /ready` — readiness
-- `POST /memory` — ingest a trace (write) · `GET /search?q=` — semantic search (read)
+- `POST /memory` — ingest a decision trace (write) · `GET /search?q=` — precedent recall (read)
+- `POST /outcome` — record how a decision turned out (write) · `POST /retract` — retract a memory (write)
 - `GET /resolve?uri=` — resolve an envelope (read)
 - `POST /distill` — distill reasoning into a fine-tune job (distill) · `GET /finetune?jobId=` — job status (read)
 - `POST /mcp` — MCP Streamable HTTP transport for remote agent harnesses (capability-gated)

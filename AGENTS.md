@@ -48,6 +48,8 @@ Production/hardening:
   per-client token-bucket limiter; returns `429` with `Retry-After`.
 - `BODY_LIMIT_BYTES` (`1000000`) / `CONTENT_MAX_LENGTH` (`100000`) / `BOUND_CONTEXT_MAX` (`256`) /
   `SEARCH_K_MAX` (`50`) — input limits.
+- `RECALL_W_SIM` (`1.0`) / `RECALL_W_OUTCOME` (`0.4`) / `RECALL_W_RECENCY` (`0.15`) /
+  `RECALL_HALF_LIFE_DAYS` (`30`) — precedent-recall ranking blend (similarity × outcome × recency).
 - `LOG_LEVEL` (`info`) — structured JSON logs; each request gets an `X-Request-Id`.
 - `HSTS_ENABLED` (`false`) — send HSTS (enable when TLS terminates at/after the proxy).
 - `STRICT_BOOT` (`false`) — fail fast at startup if `PUBLIC_KEY`/`PRIVATE_KEY`/`DATABASE_URL`
@@ -64,10 +66,15 @@ Production/hardening:
 - `GET /ready` — readiness (`200` only when it can serve: key valid + DB connected + schema);
   `503` otherwise. Use this for orchestrator readiness probes.
 - `GET /resolve?uri=...` — resolve an envelope by URI (read capability).
-- `POST /memory` — ingest a reasoning trace as a signed `trace://` envelope + RAG index entry
-  (write capability). Body: `{ task?, content, boundContext?, trustDomain?, uri? }`.
-- `GET /search?q=...&k=5&domain=acme` — semantic search; returns JSON-AM pointers + scores
-  (read capability).
+- `POST /memory` — ingest a decision/reasoning trace as a signed `trace://` envelope + recall
+  index entry (write capability). Body: `{ task?, content, boundContext?, decision?, outcome?,
+  confidence?, importance?, supersedes?, trustDomain?, uri? }`. `supersedes` marks the prior
+  version superseded (revision).
+- `POST /outcome` — record how a decision turned out (write). Body: `{ decisionUri, status,
+  score?, evidence? }`. Writes a signed `Outcome` envelope + updates recall weighting.
+- `POST /retract` — exclude a memory from recall, preserved for audit (write). Body: `{ uri, reason? }`.
+- `GET /search?q=...&k=5&domain=acme` — precedent recall (read): returns precedents (reasoning,
+  decision, outcome, lineage) ranked by similarity × outcome × recency; excludes superseded/retracted.
 - `POST /distill` — distill stored reasoning/memory into a fine-tune job (capability action
   `distill`). Body: `{ trustDomain?, kind?, since?, limit?, format?, baseModel?, suffix? }`.
   Returns `{ datasetUri, examples, provider, baseModel, jobId, status, model }`.
@@ -79,8 +86,10 @@ Production/hardening:
 
 `server/mcp/` exposes CARMA to any MCP-compatible agent harness over two transports —
 CARMA is not tied to a specific framework or model provider, it speaks the open protocol.
-Tools: `store_trace({ task, content, boundContext })` and `search_memory({ query, k })`;
-plus resource reads (`memory://<domain>/*`).
+Tools: `store_trace({ task, content, boundContext, decision?, outcome?, confidence?, importance?,
+supersedes? })`, `record_outcome({ decisionUri, status, score?, evidence? })`,
+`retract_memory({ uri, reason? })`, and `search_memory({ query, k })` (precedent recall);
+plus resource reads (`memory://<domain>/*`). Envelope schema: JSON-AM v0.1.3-draft (`docs/JSON-AM.md`).
 
 - **stdio** (`npm run mcp`) — for local harnesses (Claude Desktop, Cursor, LangGraph, custom
   SDK clients). A stdio connection is a trusted local channel: it operates under `TRUST_DOMAIN`,

@@ -54,6 +54,24 @@
 - [ ] Job lifecycle tracking table + webhooks; auto-deploy of the hosted model
 - [ ] DPO/RFT and eval-set support; external embedding + reranking for selection
 
+## Phase 2.8 - Decision memory & precedent recall ✓
+- [x] JSON-AM v0.1.3-draft (additive): `decision`, `outcome`, `lineage`,
+      `confidence`, `importance`, `status` on traces + a first-class `Outcome`
+      envelope type (`src/schema.ts`, `docs/JSON-AM.md`).
+- [x] Outcome recording — signed `Outcome` envelope + denormalized columns via
+      `POST /outcome` / MCP `record_outcome`.
+- [x] Revision & retraction — `supersedes` on ingest marks prior versions
+      superseded; `POST /retract` / MCP `retract_memory` excludes from recall
+      while preserving audit/lineage.
+- [x] Precedent recall — similarity × outcome × recency ranking over active
+      memories; results carry reasoning + decision + outcome + lineage
+      (`adapters/postgres.ts`, `server/recall.ts`); weights configurable.
+- [ ] Consolidation on write — dedup/reinforce near-duplicates (reinforcement
+      count, decay), candidate→consolidated→pinned tiers, human review queue.
+- [ ] Episodic→semantic distillation — condense recurring precedents into
+      reusable principles; outcome-weighted dataset selection for fine-tuning.
+- [ ] Governed cross-domain (federated) recall.
+
 ## Phase 3 - Ecosystem
 - [ ] Federation via ANS
 - [ ] Bridge adapters (Markdown, File)
