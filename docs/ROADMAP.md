@@ -6,13 +6,30 @@
 - [x] Docs
 
 ## Phase 2 - Production Ready
-- [ ] Full JWS signing/verification
-- [ ] Postgres adapter with migrations
-- [ ] JWT capability issuance
-- [ ] MCP server implementation
-- [ ] Tests and CI
+- [x] Full JWS signing/verification — Ed25519 compact JWS over canonical envelope
+      JSON (`server/middleware/jws.ts`); envelopes are signed on ingest and
+      verifiable via `verifyEnvelope`.
+- [x] Postgres adapter with migrations — versioned, idempotent migrations
+      (`adapters/migrations/*.sql`) applied by `npm run migrate`.
+- [x] JWT capability issuance — `issueCapability` (`server/capability.ts`) + the
+      `npm run mint-token` CLI. (A full mTLS-gated `POST /capability` refresh
+      endpoint per docs/SECURITY.md is still future work.)
+- [x] MCP server implementation — `store_trace` / `search_memory` tools and
+      Postgres-backed resource reads over stdio (`server/mcp/`).
+- [x] Tests and CI — unit + integration + MCP tests (`npm test`) and a GitHub
+      Actions workflow with a pgvector service.
+
+## Phase 2.5 - Trace ingestion & RAG ✓
+- [x] Trace ingestion — `POST /memory` and the MCP `store_trace` tool build a
+      signed JSON-AM `trace://` envelope and persist it.
+- [x] RAG index — pgvector `embedding` column + pluggable embeddings
+      (`server/embedding.ts`, local deterministic default); `GET /search` and the
+      MCP `search_memory` tool return JSON-AM pointers ranked by similarity.
+- [ ] Pluggable external embedding providers (e.g. hosted embeddings API) — the
+      provider interface exists; only the local provider is implemented.
 
 ## Phase 3 - Ecosystem
 - [ ] Federation via ANS
-- [ ] Bridge adapters
-- [ ] Web UI
+- [ ] Bridge adapters (Markdown, File)
+- [~] Web UI — a built-in configuration/readiness UI ships at `/`; a full
+      management UI is still open.
