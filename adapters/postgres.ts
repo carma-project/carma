@@ -14,18 +14,29 @@ export interface MemoryRecord {
   outcomeScore?: number | null;
   confidence?: number | null;
   importance?: number | null;
+  tier?: string;
 }
 
 // Recall ranking weights. Blends semantic similarity with an outcome signal
-// (prefer reasoning that worked) and recency decay — closer to human recall
-// than raw cosine distance.
+// (prefer reasoning that worked), recency decay, a reinforcement bonus for
+// recurring memories, and a *slight* boost for human-pinned memories — closer
+// to human recall than raw cosine distance.
 export interface RecallWeights {
   sim?: number;
   outcome?: number;
   recency?: number;
   halfLifeDays?: number;
+  reinforce?: number;
+  pinnedBoost?: number;
 }
-const DEFAULT_WEIGHTS: Required<RecallWeights> = { sim: 1.0, outcome: 0.4, recency: 0.15, halfLifeDays: 30 };
+const DEFAULT_WEIGHTS: Required<RecallWeights> = {
+  sim: 1.0,
+  outcome: 0.4,
+  recency: 0.15,
+  halfLifeDays: 30,
+  reinforce: 0.05,
+  pinnedBoost: 0.1,
+};
 
 export interface PoolOptions {
   ssl?: any;
@@ -85,8 +96,8 @@ export class PostgresAdapter {
     const query = `
       INSERT INTO agent_memory
         (uri, kind, trust_domain, envelope, signature, content, embedding,
-         status, supersedes, outcome_status, outcome_score, confidence, importance)
-      VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10, $11, $12, $13)
+         status, supersedes, outcome_status, outcome_score, confidence, importance, tier)
+      VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10, $11, $12, $13, $14)
       ON CONFLICT (uri) DO UPDATE SET
         kind = EXCLUDED.kind,
         trust_domain = EXCLUDED.trust_domain,
@@ -99,7 +110,8 @@ export class PostgresAdapter {
         outcome_status = EXCLUDED.outcome_status,
         outcome_score = EXCLUDED.outcome_score,
         confidence = EXCLUDED.confidence,
-        importance = EXCLUDED.importance
+        importance = EXCLUDED.importance,
+        tier = EXCLUDED.tier
       RETURNING uri`;
     const res = await this.pool.query(query, [
       rec.uri,
@@ -115,8 +127,90 @@ export class PostgresAdapter {
       rec.outcomeScore ?? null,
       rec.confidence ?? null,
       rec.importance ?? null,
+      rec.tier ?? 'working',
     ]);
     return res.rows[0];
+  }
+
+  // Top active neighbor by cosine similarity (for consolidation dedup checks).
+  async nearestNeighbor(opts: { embedding: string; trustDomain?: string | null; excludeUri?: string }) {
+    if (!opts.embedding) return null;
+    const params: any[] = [opts.embedding];
+    let where = "embedding IS NOT NULL AND status = 'active'";
+    if (opts.trustDomain) {
+      params.push(opts.trustDomain);
+      where += ` AND trust_domain = $${params.length}`;
+    }
+    if (opts.excludeUri) {
+      params.push(opts.excludeUri);
+      where += ` AND uri <> $${params.length}`;
+    }
+    const res = await this.pool.query(
+      `SELECT uri, 1 - (embedding <=> $1::vector) AS similarity
+       FROM agent_memory WHERE ${where}
+       ORDER BY embedding <=> $1::vector LIMIT 1`,
+      params
+    );
+    return res.rows[0] || null;
+  }
+
+  // --- Consolidation review queue -------------------------------------------
+  async enqueueReview(item: { trustDomain: string; candidateUri: string; similarUri: string; similarity: number }) {
+    const res = await this.pool.query(
+      `INSERT INTO memory_review (trust_domain, candidate_uri, similar_uri, similarity)
+       VALUES ($1, $2, $3, $4) RETURNING id`,
+      [item.trustDomain, item.candidateUri, item.similarUri, item.similarity]
+    );
+    return res.rows[0].id;
+  }
+
+  async listReviews(opts: { trustDomain?: string | null; status?: string; limit?: number } = {}) {
+    const params: any[] = [];
+    let where = '1=1';
+    if (opts.trustDomain) {
+      params.push(opts.trustDomain);
+      where += ` AND trust_domain = $${params.length}`;
+    }
+    params.push(opts.status ?? 'pending');
+    where += ` AND status = $${params.length}`;
+    params.push(Math.min(opts.limit ?? 100, 1000));
+    const res = await this.pool.query(
+      `SELECT id, trust_domain, candidate_uri, similar_uri, similarity, status, created_at
+       FROM memory_review WHERE ${where} ORDER BY created_at ASC LIMIT $${params.length}`,
+      params
+    );
+    return res.rows;
+  }
+
+  async getReview(id: number | string) {
+    const res = await this.pool.query(`SELECT * FROM memory_review WHERE id = $1`, [id]);
+    return res.rows[0] || null;
+  }
+
+  async closeReview(id: number | string, status: string, resolution: string, resolver?: string) {
+    await this.pool.query(
+      `UPDATE memory_review SET status = $1, resolution = $2, resolver = $3, resolved_at = now() WHERE id = $4`,
+      [status, resolution, resolver ?? null, id]
+    );
+  }
+
+  // Strengthen a recurring memory; auto-promote working -> consolidated when it
+  // crosses the reinforcement threshold.
+  async reinforce(uri: string, promoteAt = 3) {
+    const res = await this.pool.query(
+      `UPDATE agent_memory
+         SET reinforcement_count = reinforcement_count + 1,
+             last_reinforced_at = now(),
+             tier = CASE WHEN tier = 'working' AND reinforcement_count + 1 >= $2 THEN 'consolidated' ELSE tier END
+       WHERE uri = $1
+       RETURNING reinforcement_count, tier`,
+      [uri, promoteAt]
+    );
+    return res.rows[0] || null;
+  }
+
+  async setTier(uri: string, tier: string) {
+    await this.pool.query(`UPDATE agent_memory SET tier = $1 WHERE uri = $2`, [tier, uri]);
   }
 
   // Mark a prior memory as superseded by a newer revision (recall returns head).
@@ -184,15 +278,25 @@ export class PostgresAdapter {
     params.push(opts.k ?? 5);
     const pK = params.length;
 
+    params.push(w.reinforce);
+    const pReinf = params.length;
+    params.push(w.pinnedBoost);
+    const pPin = params.length;
+
     const simExpr = `(1 - (embedding <=> $1::vector))`;
     // Neutral (0) when no outcome is known, so undecided memories aren't penalized.
     const outExpr = `COALESCE(outcome_score, CASE outcome_status WHEN 'success' THEN 1 WHEN 'failure' THEN -1 WHEN 'mixed' THEN 0 ELSE 0 END, 0)`;
     const recExpr = `EXP(- EXTRACT(EPOCH FROM (now() - created_at)) / $${pHalf})`;
-    const scoreExpr = `($${pSim} * ${simExpr} + $${pOut} * (${outExpr}) + $${pRec} * ${recExpr})`;
+    // Bounded reinforcement bonus in [0,1); recurring memories surface higher.
+    const reinfExpr = `(1 - EXP(- reinforcement_count::float / 3))`;
+    // Slight additive boost for human-pinned memories (not an override).
+    // Float constants so PG doesn't infer the weight param as integer.
+    const pinExpr = `CASE WHEN tier = 'pinned' THEN 1.0 ELSE 0.0 END`;
+    const scoreExpr = `($${pSim}::float8 * ${simExpr} + $${pOut}::float8 * (${outExpr}) + $${pRec}::float8 * ${recExpr} + $${pReinf}::float8 * ${reinfExpr} + $${pPin}::float8 * ${pinExpr})`;
 
     const query = `
       SELECT uri, kind, trust_domain, envelope, status, supersedes, superseded_by,
-             outcome_status, outcome_score, created_at,
+             outcome_status, outcome_score, tier, reinforcement_count, created_at,
              ${simExpr} AS similarity,
              ${scoreExpr} AS score
       FROM agent_memory
@@ -201,6 +305,48 @@ export class PostgresAdapter {
       LIMIT $${pK}`;
     const res = await this.pool.query(query, params);
     return res.rows;
+  }
+
+  // Resolve a pending consolidation review. merge -> reinforce the canonical
+  // memory and supersede the duplicate; keep_separate -> promote the candidate
+  // to consolidated; reject -> retract the candidate. Never merges silently.
+  async resolveReview(
+    id: number | string,
+    resolution: 'merge' | 'keep_separate' | 'reject',
+    opts: { resolver?: string; promoteAt?: number } = {}
+  ) {
+    const review = await this.getReview(id);
+    if (!review) throw new Error('Review not found: ' + id);
+    if (review.status !== 'pending') throw new Error('Review already resolved: ' + id);
+
+    if (resolution === 'merge') {
+      const r = await this.reinforce(review.similar_uri, opts.promoteAt ?? 3);
+      await this.markSuperseded(review.candidate_uri, review.similar_uri, review.trust_domain);
+      await this.closeReview(id, 'merged', 'merge', opts.resolver);
+      return { id, resolution: 'merge', canonical: review.similar_uri, merged: review.candidate_uri, reinforcement: r?.reinforcement_count, tier: r?.tier };
+    }
+    if (resolution === 'keep_separate') {
+      await this.setTier(review.candidate_uri, 'consolidated');
+      await this.closeReview(id, 'kept_separate', 'keep_separate', opts.resolver);
+      return { id, resolution: 'keep_separate', promoted: review.candidate_uri };
+    }
+    if (resolution === 'reject') {
+      await this.setStatus(review.candidate_uri, 'retracted');
+      await this.closeReview(id, 'rejected', 'reject', opts.resolver);
+      return { id, resolution: 'reject', retracted: review.candidate_uri };
+    }
+    throw new Error('Unknown resolution: ' + resolution);
+  }
+
+  async pendingReviewCount(trustDomain?: string | null) {
+    const params: any[] = [];
+    let where = "status = 'pending'";
+    if (trustDomain) {
+      params.push(trustDomain);
+      where += ` AND trust_domain = $${params.length}`;
+    }
+    const res = await this.pool.query(`SELECT count(*)::int AS n FROM memory_review WHERE ${where}`, params);
+    return res.rows[0].n;
   }
 
   // Bulk selection of stored envelopes for distillation/export.

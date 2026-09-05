@@ -17,6 +17,9 @@ export function toPrecedent(row: any) {
     reasoning: e.content ?? null,
     outcome,
     status: row.status ?? e.status ?? 'active',
+    tier: row.tier ?? null,
+    pinned: row.tier === 'pinned',
+    reinforcementCount: row.reinforcement_count != null ? Number(row.reinforcement_count) : null,
     lineage: {
       supersedes: e.lineage?.supersedes ?? row.supersedes ?? null,
       supersededBy: row.superseded_by ?? null,
@@ -33,5 +36,17 @@ export function weightsFromConfig(config: any) {
     outcome: config?.recallWOutcome,
     recency: config?.recallWRecency,
     halfLifeDays: config?.recallHalfLifeDays,
+    reinforce: config?.recallWReinforce,
+    pinnedBoost: config?.recallPinnedBoost,
+  };
+}
+
+// Consolidation policy (on-write) derived from config.
+export function policyFromConfig(config: any) {
+  return {
+    consolidate: true,
+    simThreshold: config?.consolidateSimThreshold,
+    tierMinConfidence: config?.tierConsolidateMinConfidence,
+    tierMinImportance: config?.tierConsolidateMinImportance,
   };
 }

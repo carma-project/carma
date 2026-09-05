@@ -64,6 +64,11 @@
 
   <ul class="steps" id="steps"></ul>
 
+  <div id="consolidation" class="overall" style="display:none; margin-top:20px;">
+    <span id="reviewPill" class="pill">0</span>
+    <span class="desc" id="reviewDesc"></span>
+  </div>
+
   <div class="bar">
     <button id="refresh">Refresh status</button>
     <span class="meta" id="meta"></span>
@@ -151,6 +156,22 @@ function render() {
   document.getElementById('meta').innerHTML =
     'trust domain: <code>' + (state.trustDomain ? esc(state.trustDomain) : 'unset') + '</code> · updated ' +
     new Date().toLocaleTimeString();
+
+  // Consolidation review queue (read-only): near-duplicate merges awaiting a
+  // human decision. Resolve via POST /reviews/resolve (write capability).
+  const cons = document.getElementById('consolidation');
+  const n = state.consolidation ? state.consolidation.pendingReviews : null;
+  if (n == null) {
+    cons.style.display = 'none';
+  } else {
+    cons.style.display = 'flex';
+    const pill = document.getElementById('reviewPill');
+    pill.textContent = n;
+    pill.className = 'pill ' + (n > 0 ? 'notready' : 'ready');
+    document.getElementById('reviewDesc').innerHTML = n > 0
+      ? n + ' near-duplicate mem<span>' + (n === 1 ? 'ory' : 'ories') + '</span> awaiting human review (merge / keep-separate / reject).'
+      : 'No consolidation reviews pending.';
+  }
 }
 
 async function load() {

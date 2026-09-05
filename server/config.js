@@ -48,6 +48,20 @@ export function parseConfig(env = {}) {
     recallWOutcome: toFloat(env.RECALL_W_OUTCOME, 0.4),
     recallWRecency: toFloat(env.RECALL_W_RECENCY, 0.15),
     recallHalfLifeDays: toFloat(env.RECALL_HALF_LIFE_DAYS, 30),
+    // Human-pinned memories get a *slight* boost (not an override).
+    recallPinnedBoost: toFloat(env.RECALL_PINNED_BOOST, 0.1),
+    // Reinforced (recurring) memories surface a little higher; bounded in [0,1).
+    recallWReinforce: toFloat(env.RECALL_W_REINFORCE, 0.05),
+    // Consolidation: on write, a near-duplicate above this cosine similarity is
+    // queued for human review (merge / keep-separate / reject) — never merged
+    // silently.
+    consolidateSimThreshold: toFloat(env.CONSOLIDATE_SIM_THRESHOLD, 0.92),
+    // A new trace enters as 'consolidated' when confident/important enough,
+    // otherwise 'working' (decays unless reinforced/promoted).
+    tierConsolidateMinConfidence: toFloat(env.TIER_CONSOLIDATE_MIN_CONFIDENCE, 0.8),
+    tierConsolidateMinImportance: toFloat(env.TIER_CONSOLIDATE_MIN_IMPORTANCE, 0.7),
+    // Reinforcement count at which a working memory auto-promotes to consolidated.
+    reinforcePromoteAt: toInt(env.REINFORCE_PROMOTE_AT, 3),
     // Distillation / fine-tuning
     finetuneProvider: (env.FINETUNE_PROVIDER || 'local').toLowerCase(),
     fireworksApiKey: env.FIREWORKS_API_KEY || '',
@@ -108,7 +122,8 @@ export function redactedSummary(cfg) {
     embedDim: cfg.embedDim,
     finetuneProvider: cfg.finetuneProvider,
     mcpHttp: cfg.mcpHttpEnabled ? cfg.mcpHttpPath : false,
-    recall: { sim: cfg.recallWSim, outcome: cfg.recallWOutcome, recency: cfg.recallWRecency, halfLifeDays: cfg.recallHalfLifeDays },
+    recall: { sim: cfg.recallWSim, outcome: cfg.recallWOutcome, recency: cfg.recallWRecency, halfLifeDays: cfg.recallHalfLifeDays, pinnedBoost: cfg.recallPinnedBoost, reinforce: cfg.recallWReinforce },
+    consolidate: { simThreshold: cfg.consolidateSimThreshold, promoteAt: cfg.reinforcePromoteAt },
     tokenMaxAgeRead: cfg.tokenMaxAgeRead,
     tokenMaxAgeWrite: cfg.tokenMaxAgeWrite,
     rateLimit: cfg.rateLimitEnabled ? { rps: cfg.rateLimitRps, burst: cfg.rateLimitBurst } : false,

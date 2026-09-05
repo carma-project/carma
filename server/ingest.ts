@@ -51,11 +51,30 @@ export function outcomeScore(outcome?: OutcomeInput | null): number | null {
   }
 }
 
+export interface ConsolidationPolicy {
+  // Detect near-duplicates and queue them for human review (never auto-merge).
+  consolidate?: boolean;
+  simThreshold?: number;
+  // Tier assignment: enter as 'consolidated' when confident/important enough.
+  tierMinConfidence?: number;
+  tierMinImportance?: number;
+}
+
+function assignTier(input: TraceInput, policy: ConsolidationPolicy): 'working' | 'consolidated' {
+  const minConf = policy.tierMinConfidence ?? 0.8;
+  const minImp = policy.tierMinImportance ?? 0.7;
+  const conf = typeof input.confidence === 'number' ? input.confidence : null;
+  const imp = typeof input.importance === 'number' ? input.importance : null;
+  if ((conf != null && conf >= minConf) || (imp != null && imp >= minImp)) return 'consolidated';
+  return 'working';
+}
+
 // Build a signed JSON-AM trace:// envelope for one decision, validate it, embed
 // its text, and persist it together with its vector so it becomes a retrievable
 // RAG pointer. Optionally records the decision made, initial outcome, salience
-// hints, and a supersedes link (revision).
-export async function storeTrace(adapter: any, ctx: IngestContext, input: TraceInput) {
+// hints, and a supersedes link (revision). New memories are tiered
+// (working/consolidated) and near-duplicates are queued for human review.
+export async function storeTrace(adapter: any, ctx: IngestContext, input: TraceInput, policy: ConsolidationPolicy = {}) {
   const task = input?.task ?? null;
   const content = input?.content ?? null;
   const boundContext = input?.boundContext ?? [];
@@ -90,7 +109,9 @@ export async function storeTrace(adapter: any, ctx: IngestContext, input: TraceI
   validateEnvelope(envelope);
 
   const text = [task, content, decision?.choice, ...(boundContext || [])].filter(Boolean).join('\n');
-  const embedding = toVectorLiteral(await embed(text));
+  const embeddingVec = await embed(text);
+  const embedding = toVectorLiteral(embeddingVec);
+  const tier = assignTier(input, policy);
 
   await adapter.store({
     uri: ctx.uri,
@@ -106,6 +127,7 @@ export async function storeTrace(adapter: any, ctx: IngestContext, input: TraceI
     outcomeScore: outcomeScore(outcome),
     confidence: typeof input?.confidence === 'number' ? input.confidence : null,
     importance: typeof input?.importance === 'number' ? input.importance : null,
+    tier,
   });
 
   // Revision: mark the prior version superseded so recall returns only the head.
@@ -113,7 +135,32 @@ export async function storeTrace(adapter: any, ctx: IngestContext, input: TraceI
     await adapter.markSuperseded(supersedes, ctx.uri, ctx.trustDomain);
   }
 
-  return { uri: ctx.uri, stored: true, supersedes: supersedes ?? undefined };
+  const result: any = { uri: ctx.uri, stored: true, tier };
+  if (supersedes) result.supersedes = supersedes;
+
+  // Consolidation: if this closely matches an existing memory, queue it for a
+  // human to decide (merge / keep-separate / reject) — never merge silently.
+  // Skipped for explicit revisions (supersedes handles those).
+  if (policy.consolidate !== false && !supersedes) {
+    const threshold = policy.simThreshold ?? 0.92;
+    const neighbor = await adapter.nearestNeighbor({
+      embedding,
+      trustDomain: ctx.trustDomain,
+      excludeUri: ctx.uri,
+    });
+    if (neighbor && Number(neighbor.similarity) >= threshold) {
+      result.reviewId = await adapter.enqueueReview({
+        trustDomain: ctx.trustDomain,
+        candidateUri: ctx.uri,
+        similarUri: neighbor.uri,
+        similarity: Number(neighbor.similarity),
+      });
+      result.reviewQueued = true;
+      result.similarTo = neighbor.uri;
+    }
+  }
+
+  return result;
 }
 
 export interface OutcomeContext {

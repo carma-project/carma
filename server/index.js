@@ -8,7 +8,7 @@ import { verifyCapability } from './middleware/jwt.js';
 import { enforceCapability, sanitizeUri, enforceTokenLifetime } from './middleware/guardrails.js';
 import { embed, toVectorLiteral } from './embedding.js';
 import { storeTrace, newTraceUri, recordOutcome, retractMemory } from './ingest.js';
-import { toPrecedent, weightsFromConfig } from './recall.js';
+import { toPrecedent, weightsFromConfig, policyFromConfig } from './recall.js';
 import { runDistillation, fineTuneStatus } from './distill/pipeline.js';
 import { CARMAMCPServer } from './mcp/index.js';
 import { PostgresAdapter } from '../adapters/postgres.js';
@@ -313,6 +313,7 @@ const server = http.createServer(async (req, res) => {
         rag: { ready: false },
         audit: { ready: false },
         mcp: { httpEnabled: config.mcpHttpEnabled, path: config.mcpHttpPath, stdio: true },
+        consolidation: { pendingReviews: null },
       };
       if (config.databaseUrl) {
         try {
@@ -321,6 +322,11 @@ const server = http.createServer(async (req, res) => {
           status.database.schemaReady = r.schemaReady;
           status.rag.ready = r.ragReady;
           status.audit.ready = r.auditReady;
+          try {
+            status.consolidation.pendingReviews = await adapter.pendingReviewCount(config.trustDomain || null);
+          } catch {
+            /* review table may not exist yet */
+          }
         } catch (e) {
           status.database.error = e.message;
         }
@@ -389,9 +395,10 @@ const server = http.createServer(async (req, res) => {
         const result = await storeTrace(
           adapter,
           { uri, trustDomain, subject: claims.sub, privateKeyPem: config.privateKeyPem },
-          input
+          input,
+          policyFromConfig(config)
         );
-        audit.record({ actor: claims.sub, action: 'write', uri, trustDomain, result: 'allow', requestId, detail: input.supersedes ? { supersedes: input.supersedes } : undefined });
+        audit.record({ actor: claims.sub, action: 'write', uri, trustDomain, result: 'allow', requestId, detail: { ...(input.supersedes ? { supersedes: input.supersedes } : {}), tier: result.tier, reviewQueued: Boolean(result.reviewQueued) } });
         return sendJson(res, 201, result);
       } catch (e) {
         logger.error('ingest_error', { requestId, error: e.message });
@@ -496,6 +503,103 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, result);
       } catch (e) {
         logger.error('retract_error', { requestId, error: e.message });
+        return sendJson(res, 400, { error: e.message });
+      }
+    }
+
+    // Pin/unpin a memory (human curation). Pinned memories get a slight recall
+    // boost and never decay. Write capability.
+    if (path === '/pin' && req.method === 'POST') {
+      if (rateLimited(req, res, requestId)) return;
+      let body;
+      try {
+        body = await readJsonBody(req, config.bodyLimitBytes);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      let uri;
+      try {
+        uri = sanitizeUri(body.uri);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      const trustDomain = domainOf(uri) || config.trustDomain;
+      const pinned = body.pinned !== false; // default true
+      let claims;
+      try {
+        claims = await authorize(req, uri, 'write');
+      } catch (e) {
+        audit.record({ action: 'pin', uri, trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const row = await adapter.resolve(uri);
+        if (!row) return sendJson(res, 404, { error: 'Not found', id: uri });
+        await adapter.setTier(uri, pinned ? 'pinned' : 'consolidated');
+        audit.record({ actor: claims.sub, action: 'pin', uri, trustDomain, result: 'allow', requestId, detail: { pinned } });
+        return sendJson(res, 200, { uri, tier: pinned ? 'pinned' : 'consolidated' });
+      } catch (e) {
+        logger.error('pin_error', { requestId, error: e.message });
+        return sendJson(res, 400, { error: e.message });
+      }
+    }
+
+    // List pending consolidation reviews (near-duplicate merge decisions). Read.
+    if (path === '/reviews' && req.method === 'GET') {
+      if (rateLimited(req, res, requestId)) return;
+      const domain = parsed.query.domain || config.trustDomain;
+      const statusFilter = parsed.query.status || 'pending';
+      try {
+        await authorize(req, `memory://${domain}/review`, 'read');
+      } catch (e) {
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const reviews = await adapter.listReviews({ trustDomain: domain || null, status: String(statusFilter) });
+        return sendJson(res, 200, { count: reviews.length, reviews });
+      } catch (e) {
+        logger.error('reviews_error', { requestId, error: e.message });
+        return sendJson(res, 500, { error: 'Internal error' });
+      }
+    }
+
+    // Resolve a consolidation review: merge | keep_separate | reject. Write.
+    if (path === '/reviews/resolve' && req.method === 'POST') {
+      if (rateLimited(req, res, requestId)) return;
+      let body;
+      try {
+        body = await readJsonBody(req, config.bodyLimitBytes);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      const resolution = body.resolution;
+      if (!['merge', 'keep_separate', 'reject'].includes(resolution)) {
+        return sendJson(res, 400, { error: 'resolution must be merge | keep_separate | reject' });
+      }
+      let review;
+      try {
+        review = await adapter.getReview(body.reviewId);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      if (!review) return sendJson(res, 404, { error: 'Review not found', id: body.reviewId });
+      const trustDomain = review.trust_domain || config.trustDomain;
+      let claims;
+      try {
+        claims = await authorize(req, `memory://${trustDomain}/review`, 'write');
+      } catch (e) {
+        audit.record({ action: 'review_resolve', trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const result = await adapter.resolveReview(body.reviewId, resolution, {
+          resolver: claims.sub,
+          promoteAt: config.reinforcePromoteAt,
+        });
+        audit.record({ actor: claims.sub, action: 'review_resolve', uri: review.candidate_uri, trustDomain, result: 'allow', requestId, detail: result });
+        return sendJson(res, 200, result);
+      } catch (e) {
+        logger.error('review_resolve_error', { requestId, error: e.message });
         return sendJson(res, 400, { error: e.message });
       }
     }
