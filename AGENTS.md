@@ -19,6 +19,10 @@ fails with `ERR_MODULE_NOT_FOUND`; `tsx` resolves the `.js` specifiers to their 
 
 ## Configuration
 
+Config is centralized and validated in `server/config.js` (`parseConfig(env)` is pure and
+unit-tested; a redacted summary is logged at boot).
+
+Core:
 - `PORT` — HTTP port (default `7100`).
 - `PUBLIC_KEY` — Ed25519 **SPKI PEM**. Imported at startup via `jose.importSPKI(..., 'EdDSA')`
   to verify capability tokens. If unset/invalid, the process still boots and `/health` works,
@@ -26,15 +30,32 @@ fails with `ERR_MODULE_NOT_FOUND`; `tsx` resolves the `.js` specifiers to their 
 - `PRIVATE_KEY` — Ed25519 **PKCS8 PEM**. Signs stored envelopes on ingest and mints tokens.
 - `DATABASE_URL` — Postgres connection string (needs pgvector). Run `npm run migrate` first.
 - `TRUST_DOMAIN` — default trust domain for ingest/search when not supplied per-request.
-- `EMBEDDING_PROVIDER` — embedding provider (default `local`, deterministic, no network).
-- `EMBED_DIM` — embedding dimension (default `256`; must match the `vector(N)` column).
+- `EMBEDDING_PROVIDER` (default `local`, deterministic, no network) / `EMBED_DIM` (default `256`,
+  must match the `vector(N)` column).
+
+Production/hardening:
+- `DATABASE_SSL` — `disable` (default) | `require` (encrypt, don't verify) | `verify` (verify CA).
+  Managed Postgres (Railway/RDS) typically needs `require`.
+- `DB_POOL_MAX` / `DB_IDLE_TIMEOUT_MS` / `DB_CONNECT_TIMEOUT_MS` — pool sizing/timeouts.
+- `TOKEN_MAX_AGE_READ` (default `3600`) / `TOKEN_MAX_AGE_WRITE` (default `900`) — per-action token
+  age ceilings in seconds (docs/SECURITY.md), enforced on top of `exp`.
+- `RATE_LIMIT_ENABLED` (default `true`) / `RATE_LIMIT_RPS` (`20`) / `RATE_LIMIT_BURST` (`40`) —
+  per-client token-bucket limiter; returns `429` with `Retry-After`.
+- `BODY_LIMIT_BYTES` (`1000000`) / `CONTENT_MAX_LENGTH` (`100000`) / `BOUND_CONTEXT_MAX` (`256`) /
+  `SEARCH_K_MAX` (`50`) — input limits.
+- `LOG_LEVEL` (`info`) — structured JSON logs; each request gets an `X-Request-Id`.
+- `HSTS_ENABLED` (`false`) — send HSTS (enable when TLS terminates at/after the proxy).
+- `STRICT_BOOT` (`false`) — fail fast at startup if `PUBLIC_KEY`/`PRIVATE_KEY`/`DATABASE_URL`
+  are missing (recommended in production).
 
 ## Endpoints
 
 - `GET /` (and `/ui`) — built-in, self-contained configuration/readiness UI (no external assets).
 - `GET /api/status` — JSON deploy diagnostics: `PUBLIC_KEY`/`PRIVATE_KEY`, DB connectivity,
-  `agent_memory` schema, and RAG (pgvector) readiness. Booleans only — never returns secrets.
-- `GET /health` — liveness.
+  `agent_memory` schema, RAG (pgvector), and audit-log readiness. Booleans only — never secrets.
+- `GET /health` — liveness (always `200` while the process is up).
+- `GET /ready` — readiness (`200` only when it can serve: key valid + DB connected + schema);
+  `503` otherwise. Use this for orchestrator readiness probes.
 - `GET /resolve?uri=...` — resolve an envelope by URI (read capability).
 - `POST /memory` — ingest a reasoning trace as a signed `trace://` envelope + RAG index entry
   (write capability). Body: `{ task?, content, boundContext?, trustDomain?, uri? }`.
@@ -75,6 +96,21 @@ The full stack (app + pgvector Postgres, migrations auto-applied) runs locally v
 - Railway uses Nixpacks (`railway.toml` -> `nixpacks.toml`), start `node --import tsx server/index.js`,
   healthcheck `/health`. Provide `DATABASE_URL`, `PUBLIC_KEY`, `PRIVATE_KEY`; add a pgvector
   Postgres service and run `npm run migrate`.
+
+## Production hardening
+
+- **AuthZ depth**: capability verify (`jwt.ts`) + per-action token-age ceiling
+  (`enforceTokenLifetime`) + domain/action enforcement (`enforceCapability`).
+- **Audit**: every access decision (allow/deny/error) is written to the append-only
+  `audit_log` table (`server/audit.js`, best-effort — never breaks the request path).
+- **Rate limiting**: per-client token bucket (`server/ratelimit.js`) on authenticated routes.
+- **Input hardening**: JSON body size cap, trace content/boundContext limits, `k` cap; consistent
+  JSON error envelopes.
+- **Observability**: structured JSON logs with per-request `X-Request-Id`; security headers
+  (`nosniff`, `no-referrer`, optional HSTS).
+- **Lifecycle**: graceful `SIGTERM`/`SIGINT` shutdown (drain server, close pool); `uncaughtException`
+  exits for orchestrator restart; pool `error` handler prevents idle-client crashes.
+- **Migrations**: `npm run migrate` takes a pg advisory lock so concurrent replicas don't race.
 
 ## Cursor Cloud specific instructions
 

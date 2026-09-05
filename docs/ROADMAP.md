@@ -28,6 +28,19 @@
 - [ ] Pluggable external embedding providers (e.g. hosted embeddings API) — the
       provider interface exists; only the local provider is implemented.
 
+## Phase 2.6 - Production hardening ✓ (in progress)
+- [x] Central validated config + fail-fast `STRICT_BOOT` + redacted boot summary
+- [x] Per-action token-lifetime ceilings (`enforceTokenLifetime`)
+- [x] Append-only audit log (`audit_log`) on every access decision
+- [x] Per-client rate limiting (429 + `Retry-After`)
+- [x] Input hardening (body/content/boundContext/k limits) + consistent JSON errors
+- [x] Structured JSON logs + per-request `X-Request-Id`; security headers
+- [x] `/ready` readiness probe; graceful shutdown; crash guards
+- [x] DB SSL modes + pool sizing/timeouts; advisory-locked migrations
+- [ ] mTLS-gated `POST /capability` issuance/refresh
+- [ ] iss/aud token checks + resource-pattern glob matching
+- [ ] Serve-path signature auto-verification; KMS/Vault-backed keys + rotation
+
 ## Phase 3 - Ecosystem
 - [ ] Federation via ANS
 - [ ] Bridge adapters (Markdown, File)
