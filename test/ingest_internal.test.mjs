@@ -127,18 +127,19 @@ test(
       const dry = await reqJson('POST', '/ingest', token, { dryRun: true });
       assert.equal(dry.status, 200, 'dry-run ok');
       assert.equal(dry.json.dryRun, true);
-      assert.ok(dry.json.reports[0].docs.count >= 2, 'dry-run counts docs');
-      assert.ok(dry.json.reports[0].commits.count >= 3, 'dry-run counts commits');
+      assert.ok(dry.json.reports[0].stored.count >= 5, 'dry-run counts items');
+      assert.ok(dry.json.reports[0].byType.commit >= 3, 'dry-run counts commits');
 
       // Real ingest: docs + commits + revert outcome, all in-process.
       const run = await reqJson('POST', '/ingest', token, {});
       assert.equal(run.status, 200, 'ingest ok');
       const rep = run.json.reports[0];
       assert.equal(rep.sourceId, 'app');
-      assert.equal(rep.repo, 'acme/app');
-      assert.ok(rep.docs.count >= 2, `docs stored (${rep.docs.count})`);
-      assert.equal(rep.docs.failed, 0, 'no doc failures');
-      assert.ok(rep.commits.count >= 3, `commits stored (${rep.commits.count})`);
+      assert.equal(rep.meta.repo, 'acme/app');
+      assert.equal(rep.stored.failed, 0, 'no store failures');
+      assert.ok(rep.stored.count >= 5, `items stored (${rep.stored.count})`);
+      assert.ok(rep.byType.commit >= 3, `commits stored (${rep.byType.commit})`);
+      assert.ok((rep.byType.doc || 0) + (rep.byType.decision || 0) >= 2, 'markdown docs/decisions stored');
       assert.equal(rep.outcomes.count, 1, 'revert recorded one failure outcome');
 
       // Curated doc is recallable and lives under the deterministic repo URI.
@@ -165,13 +166,13 @@ test(
       assert.ok(Array.isArray(status.ingest.sources), 'status lists sources');
       const src = status.ingest.sources.find((s) => s.id === 'app');
       assert.ok(src && src.lastRunAt, 'source shows lastRunAt');
-      assert.ok(src.lastResult && src.lastResult.commits.count >= 3, 'lastResult has counts');
+      assert.ok(src.lastResult && src.lastResult.stored.count >= 5, 'lastResult has counts');
+      assert.ok(src.lastResult.byType.commit >= 3, 'lastResult byType has commits');
 
       // Idempotent: re-running upserts in place (deterministic URIs), no errors.
       const again = await reqJson('POST', '/ingest', token, { sourceId: 'app' });
       assert.equal(again.status, 200, 're-ingest ok');
-      assert.equal(again.json.reports[0].docs.failed, 0);
-      assert.equal(again.json.reports[0].commits.failed, 0);
+      assert.equal(again.json.reports[0].stored.failed, 0);
 
       // Unknown source id is a clean 404.
       const bad = await reqJson('POST', '/ingest', token, { sourceId: 'nope' });
@@ -230,14 +231,14 @@ test(
       for (let i = 0; i < 60; i++) {
         const status = (await reqJson('GET', '/api/status', token, null, PORT_BOOT)).json;
         const src = status.ingest.sources.find((s) => s.id === 'app');
-        if (src && src.lastRunAt && src.lastResult && src.lastResult.commits.count >= 3) {
+        if (src && src.lastRunAt && src.lastResult && src.lastResult.stored.count >= 5) {
           ran = src;
           break;
         }
         await new Promise((r) => setTimeout(r, 250));
       }
       assert.ok(ran, 'source auto-ingested at boot without an external trigger');
-      assert.ok(ran.lastResult.docs.count >= 2, 'boot ingest stored docs');
+      assert.ok(ran.lastResult.byType.commit >= 3, 'boot ingest stored history');
 
       // And the memory is immediately recallable.
       const hit = (await reqJson('GET', `/search?q=${encodeURIComponent('onboarding staging environment')}&k=5`, token, null, PORT_BOOT)).json;
