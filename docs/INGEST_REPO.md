@@ -66,6 +66,24 @@ per-write near-duplicate review (that would flood the queue); run `POST /consoli
 dream`) afterwards to dedup and abstract. This closes the loop entirely inside the container:
 **pull** (ingest) → **consolidate** (dream) → **post-train** (`POST /distill`).
 
+### More than git: pluggable connectors
+
+`git` is one connector. The same source registry (and the same `POST /ingest` / scheduler / status)
+also supports pulling from other systems, so CARMA draws on "repos for history, databases for all
+info, multiple systems for context":
+
+| `type` | pulls | key fields |
+| --- | --- | --- |
+| `git` | markdown + commit history | `url`/`path`, `repo?`, `branch?`, `docs?`, `history?`, `tokenEnv?` |
+| `postgres` | rows from a read-only SQL query | `dsnEnv`/`dsn`, `query`, `columns:{id,title,content,date?,decision?}`, `ssl?` |
+| `http` | a JSON list from any API | `url`, `itemsPath?`, `fields:{id,title,content,date?,decision?}`, `tokenEnv?`, `headers?` |
+| `github` | issues + PRs (with comment threads) | `repo:"owner/name"`, `tokenEnv?`, `state?`, `since?`, `maxPages?`, `includeComments?` |
+
+The `github` connector also derives outcome signal (merged PR → success, "not planned" → failure).
+Connectors live in `server/ingest/connectors/`; adding one never touches the write path. For a full,
+multi-system wiring see [`CYBERORBIT.md`](CYBERORBIT.md) and
+[`examples/cyberorbit-sources.json`](examples/cyberorbit-sources.json).
+
 ## How files are mapped
 
 | Signal | Result |

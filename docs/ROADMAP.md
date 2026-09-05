@@ -125,9 +125,12 @@ the container, no external orchestration required:
       per-source `intervalMinutes`) — the acquisition counterpart to the dream scheduler.
 - [x] Unified extraction — the standalone CLIs (`ingest-repo`/`ingest-git`) and the
       native engine share one extractor, so external push and internal pull are identical.
-- [ ] More connectors — `postgres`/SQL, HTTP/APIs, issue trackers, and chat, so CARMA
-      draws context from "multiple systems for context, repos for history, databases for
-      all info" through the same source registry.
+- [x] More connectors — pluggable connector registry (`server/ingest/connectors/`) with
+      `git`, `postgres` (read-only SQL query → memory), `http` (JSON API list → memory), and
+      `github` (issues/PRs + comment threads; merged/closed → outcome signal). Adding a
+      connector never touches the write path. Cyberorbit wiring: `docs/CYBERORBIT.md` +
+      `docs/examples/cyberorbit-sources.json`.
+- [ ] Chat/other connectors (Slack, Linear, Jira) — same registry; likely thin wrappers over `http`.
 - [ ] Incremental/state-aware pulls — persist per-source cursors (last commit/sha,
       high-water marks) in the DB so scheduled runs only fetch deltas at scale.
 - [ ] Self-driving pipeline — optional post-ingest `dream` + threshold-triggered

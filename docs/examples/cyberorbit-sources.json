@@ -1,0 +1,49 @@
+[
+  {
+    "id": "cyberorbit-repo",
+    "type": "git",
+    "url": "https://github.com/cyberorbit/platform.git",
+    "repo": "cyberorbit/platform",
+    "branch": "main",
+    "tokenEnv": "CYBERORBIT_GITHUB_TOKEN",
+    "docs": true,
+    "history": true,
+    "intervalMinutes": 60,
+    "_comment": "Agent specs (.cursor/AGENTS.md), ADRs (decisions/), the company OS docs, and the full commit history (every change + its reasoning, with revert = failure signal)."
+  },
+  {
+    "id": "cyberorbit-findings",
+    "type": "postgres",
+    "dsnEnv": "CYBERORBIT_DB_DSN",
+    "ssl": true,
+    "query": "SELECT f.id, f.title, f.narrative AS body, f.created_at, f.remediation AS verdict FROM findings f WHERE f.created_at > now() - interval '365 days' ORDER BY f.created_at",
+    "columns": { "id": "id", "title": "title", "content": "body", "date": "created_at", "decision": "verdict" },
+    "confidence": 0.8,
+    "importance": 0.85,
+    "intervalMinutes": 180,
+    "_comment": "Pentest findings + the remediation decision taken. This is the distilled reasoning that post-training a Cyberorbit model should learn from. Use a READ-ONLY DB role; prefer dsnEnv over inlining creds."
+  },
+  {
+    "id": "cyberorbit-tracker",
+    "type": "github",
+    "repo": "cyberorbit/platform",
+    "tokenEnv": "CYBERORBIT_GITHUB_TOKEN",
+    "state": "all",
+    "includeComments": true,
+    "maxPages": 10,
+    "intervalMinutes": 120,
+    "_comment": "Issues + PRs (titles, descriptions, review threads) — where the decision discussion lives. Merged PR -> success, 'not planned' -> failure, feeding outcome-weighted recall."
+  },
+  {
+    "id": "cyberorbit-playbooks",
+    "type": "http",
+    "url": "https://kb.internal.cyberorbit/api/playbooks",
+    "tokenEnv": "CYBERORBIT_KB_TOKEN",
+    "itemsPath": "data",
+    "fields": { "id": "slug", "title": "name", "content": "markdown", "date": "updated_at" },
+    "confidence": 0.85,
+    "importance": 0.8,
+    "intervalMinutes": 240,
+    "_comment": "Optional: internal playbooks/runbooks exposed as a JSON API. Remove if not applicable."
+  }
+]

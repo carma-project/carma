@@ -18,12 +18,13 @@ Guidance for coding agents working on CARMA (JSON-AM reference implementation).
   in-process, exercises status/ingest/outcome/search/consolidate over `fetch`; no `curl`/`jq` needed,
   so it runs inside the `node:20-alpine` container). Override with `--url`/`--domain`/`--k`.
 - **Native ingestion (recommended): CARMA pulls sources itself, in-process** — no external
-  cron/CI. Declare `SOURCES` (JSON) and either trigger `POST /ingest` (write; body
+  cron/CI. Declare `SOURCES` (JSON) — git repos, Postgres/SQL, HTTP JSON APIs, and GitHub
+  issues/PRs (see Configuration) — and either trigger `POST /ingest` (write; body
   `{ sourceId?, dryRun? }`) or enable the scheduler (`INGEST_ON_BOOT` / `INGEST_SCHEDULER_ENABLED`
-  + per-source `intervalMinutes`). CARMA clones/updates the repo and stores markdown + git history
-  via `storeTrace` directly (signed with the server `PRIVATE_KEY`; no token minted). This is the
-  acquisition counterpart to `dream`, closing the loop **pull → consolidate → post-train** inside
-  the container. Shares extractors with the CLIs below. See `docs/INGEST_REPO.md` §0.
+  + per-source `intervalMinutes`). CARMA collects each source and stores memory via `storeTrace`
+  directly (signed with the server `PRIVATE_KEY`; no token minted). This is the acquisition
+  counterpart to `dream`, closing the loop **pull → consolidate → post-train** inside the
+  container. Git ingestion shares extractors with the CLIs below. See `docs/INGEST_REPO.md` §0.
 - Ingest a repo's markdown (agent specs, decisions/ADRs, "company OS" docs) into memory *from
   outside* (push via `POST /memory`; for air-gapped sources or ad-hoc backfills):
   `npm run ingest-repo -- --dir <path> --url <carma-url> --domain <domain> [--repo owner/name]
@@ -100,10 +101,20 @@ Production/hardening:
   deterministic and offline; `fireworks` uses an OpenAI-compatible chat endpoint and falls back to
   local on any error. Provider-neutral — bring any backend.
 Native ingestion (sources CARMA pulls itself):
-- `SOURCES` (inline JSON array) or `SOURCES_FILE` (path to that JSON) — source definitions. Each:
-  `{ id, type:"git", url, repo?, branch?, since?, docs?, history?, maxCommits?, exclude?,
-  intervalMinutes?, tokenEnv? }`. `url` may be a git URL or a local path; `tokenEnv` names an env var
-  holding a PAT for private https clones. `intervalMinutes>0` makes a source eligible for the scheduler.
+- `SOURCES` (inline JSON array) or `SOURCES_FILE` (path to that JSON) — source definitions, one per
+  connector. Pluggable connectors live in `server/ingest/connectors/` (registry in `index.ts`); the
+  common write path is `server/ingest/run.ts`. `intervalMinutes>0` makes a source eligible for the
+  scheduler. Supported `type`s:
+  - `git` — `{ id, type:"git", url|path, repo?, branch?, since?, docs?, history?, maxCommits?, exclude?, tokenEnv? }`.
+    Ingests markdown (specs/decisions/OS docs) + full commit history (reverts → failure outcome).
+  - `postgres` — `{ id, type:"postgres", dsnEnv|dsn, query, ssl?, columns:{id,title,content,date?,decision?}, confidence?, importance? }`.
+    Runs a read-only SQL query; each row → a memory. Use a read-only role; prefer `dsnEnv`.
+  - `http` — `{ id, type:"http", url, headers?, tokenEnv?, itemsPath?, fields:{id,title,content,date?,decision?}, confidence?, importance? }`.
+    GETs a JSON list (at `itemsPath`) and maps each record.
+  - `github` — `{ id, type:"github", repo:"owner/name", tokenEnv?, apiBase?, state?, since?, maxPages?, includeComments?, maxComments? }`.
+    Ingests issues + PRs (with comment threads); merged PR → success, "not planned" → failure.
+  Secrets (`dsn`, `url`, `query`, tokens) never appear in `/api/status` or logs. See `docs/INGEST_REPO.md`;
+  a full Cyberorbit wiring is in `docs/CYBERORBIT.md` + `docs/examples/cyberorbit-sources.json`.
 - `INGEST_WORK_DIR` (`/tmp/carma-sources`) — where checkouts are cloned/cached (fast-forwarded on re-run).
 - `INGEST_ON_BOOT` (`false`) — pull all sources once shortly after startup (first-deploy backfill).
 - `INGEST_SCHEDULER_ENABLED` (`false`) / `INGEST_SCHEDULER_TICK_MS` (`60000`) — run due sources on
