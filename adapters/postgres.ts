@@ -10,10 +10,50 @@ export interface MemoryRecord {
   embedding: string; // pgvector literal, e.g. "[0.1,0.2,...]"
 }
 
+export interface PoolOptions {
+  ssl?: any;
+  max?: number;
+  idleTimeoutMillis?: number;
+  connectionTimeoutMillis?: number;
+}
+
 export class PostgresAdapter {
   private pool: any;
-  constructor(connectionString: string) {
-    this.pool = new Pool({ connectionString });
+  constructor(connectionString: string, opts: PoolOptions = {}) {
+    this.pool = new Pool({
+      connectionString,
+      ssl: opts.ssl ?? false,
+      max: opts.max ?? 10,
+      idleTimeoutMillis: opts.idleTimeoutMillis ?? 30000,
+      connectionTimeoutMillis: opts.connectionTimeoutMillis ?? 5000,
+    });
+    // A pool 'error' on an idle client is otherwise an unhandled 'error' event
+    // that crashes the process.
+    this.pool.on('error', () => {});
+  }
+
+  async audit(entry: {
+    actor?: string;
+    action?: string;
+    uri?: string;
+    trustDomain?: string;
+    result?: string;
+    requestId?: string;
+    detail?: any;
+  }) {
+    await this.pool.query(
+      `INSERT INTO audit_log (actor, action, uri, trust_domain, result, request_id, detail)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        entry.actor ?? null,
+        entry.action ?? null,
+        entry.uri ?? null,
+        entry.trustDomain ?? null,
+        entry.result ?? null,
+        entry.requestId ?? null,
+        entry.detail ? JSON.stringify(entry.detail) : null,
+      ]
+    );
   }
 
   async resolve(uri: string) {
@@ -87,6 +127,7 @@ export class PostgresAdapter {
 
   async check() {
     const t = await this.pool.query("SELECT to_regclass('public.agent_memory') AS tbl");
+    const audit = await this.pool.query("SELECT to_regclass('public.audit_log') AS tbl");
     const ext = await this.pool.query("SELECT 1 FROM pg_extension WHERE extname = 'vector'");
     let hasEmbedding = false;
     try {
@@ -101,6 +142,7 @@ export class PostgresAdapter {
       connected: true,
       schemaReady: t.rows[0]?.tbl !== null,
       ragReady: ext.rows.length > 0 && hasEmbedding,
+      auditReady: audit.rows[0]?.tbl !== null,
     };
   }
 }

@@ -15,7 +15,12 @@ if (!DATABASE_URL) {
 const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'migrations');
 const pool = new pg.Pool({ connectionString: DATABASE_URL });
 
+// Serialize migrations across concurrent instances (e.g. rolling deploys) with
+// a session-level advisory lock on a fixed key.
+const LOCK_KEY = 776_1001;
+
 try {
+  await pool.query('SELECT pg_advisory_lock($1)', [LOCK_KEY]);
   await pool.query(
     `CREATE TABLE IF NOT EXISTS schema_migrations (
        version TEXT PRIMARY KEY,
@@ -51,5 +56,10 @@ try {
   }
   console.log(`migrations complete (${count} applied, ${files.length} total)`);
 } finally {
+  try {
+    await pool.query('SELECT pg_advisory_unlock($1)', [LOCK_KEY]);
+  } catch {
+    /* lock is released on disconnect regardless */
+  }
   await pool.end();
 }
