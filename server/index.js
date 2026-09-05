@@ -6,6 +6,7 @@ import { verifyCapability } from './middleware/jwt.js';
 import { enforceCapability, sanitizeUri, enforceTokenLifetime } from './middleware/guardrails.js';
 import { embed, toVectorLiteral } from './embedding.js';
 import { storeTrace, newTraceUri } from './ingest.js';
+import { runDistillation, fineTuneStatus } from './distill/pipeline.js';
 import { PostgresAdapter } from '../adapters/postgres.js';
 import { config, redactedSummary } from './config.js';
 import { makeLogger, newRequestId } from './logger.js';
@@ -301,6 +302,64 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         logger.error('search_error', { requestId, error: e.message });
         return sendJson(res, 500, { error: 'Internal error' });
+      }
+    }
+
+    // Distill stored reasoning/memory into a fine-tune job (distill capability).
+    if (path === '/distill' && req.method === 'POST') {
+      if (rateLimited(req, res, requestId)) return;
+      let body;
+      try {
+        body = await readJsonBody(req, config.bodyLimitBytes);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      const trustDomain = body.trustDomain || config.trustDomain;
+      if (!trustDomain) return sendJson(res, 400, { error: 'trustDomain not set (body.trustDomain or TRUST_DOMAIN)' });
+      let claims;
+      try {
+        claims = await authorize(req, `memory://${trustDomain}/dataset`, 'distill');
+      } catch (e) {
+        audit.record({ action: 'distill', trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const result = await runDistillation(adapter, config, {
+          trustDomain,
+          kind: body.kind ?? 'trace',
+          since: body.since ?? null,
+          limit: body.limit,
+          format: body.format,
+          baseModel: body.baseModel,
+          suffix: body.suffix,
+          subject: claims.sub,
+        });
+        audit.record({ actor: claims.sub, action: 'distill', uri: result.datasetUri, trustDomain, result: 'allow', requestId, detail: { examples: result.examples, provider: result.provider, jobId: result.jobId } });
+        return sendJson(res, 201, result);
+      } catch (e) {
+        logger.error('distill_error', { requestId, error: e.message });
+        audit.record({ action: 'distill', trustDomain, result: 'error', requestId, detail: { error: e.message } });
+        return sendJson(res, 400, { error: e.message });
+      }
+    }
+
+    // Fine-tune job status via the configured provider (read capability).
+    if (path === '/finetune' && req.method === 'GET') {
+      if (rateLimited(req, res, requestId)) return;
+      const jobId = parsed.query.jobId;
+      const domain = parsed.query.domain || config.trustDomain;
+      if (!jobId) return sendJson(res, 400, { error: 'Missing query parameter jobId' });
+      try {
+        await authorize(req, `memory://${domain}/dataset`, 'read');
+      } catch (e) {
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const status = await fineTuneStatus(config, String(jobId));
+        return sendJson(res, 200, status);
+      } catch (e) {
+        logger.error('finetune_status_error', { requestId, error: e.message });
+        return sendJson(res, 502, { error: e.message });
       }
     }
 
