@@ -1,4 +1,5 @@
 import http from 'http';
+import https from 'https';
 import url from 'url';
 import { readFileSync } from 'fs';
 import { randomUUID } from 'crypto';
@@ -6,6 +7,9 @@ import { importSPKI } from 'jose';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { verifyCapability } from './middleware/jwt.js';
 import { enforceCapability, sanitizeUri, enforceTokenLifetime } from './middleware/guardrails.js';
+import { issueCapability } from './capability.js';
+import { clientIdentity } from './mtls.js';
+import { boundGrant } from './capability_issue.js';
 import { embed, toVectorLiteral } from './embedding.js';
 import { storeTrace, newTraceUri, recordOutcome, retractMemory } from './ingest.js';
 import { toPrecedent, weightsFromConfig, policyFromConfig } from './recall.js';
@@ -41,6 +45,14 @@ const adapter = new PostgresAdapter(config.databaseUrl, {
 });
 const memoryModel = getMemoryModel(config);
 const audit = new Audit(adapter, logger, { enabled: Boolean(config.databaseUrl) });
+
+// Policy ceilings for tokens minted by POST /capability. A client can only ever
+// receive a subset of this (further narrowed on refresh by any presented token).
+const capabilityPolicy = {
+  domains: config.capabilityDomains,
+  actions: config.capabilityMaxActions,
+  maxTtlSeconds: config.capabilityMaxTtlSeconds,
+};
 const limiter = new RateLimiter({ rps: config.rateLimitRps, burst: config.rateLimitBurst });
 
 for (const w of config.warnings) logger.warn('config_warning', { detail: w });
@@ -256,7 +268,7 @@ function validateOutcome(o) {
 
 // ---------- server ----------
 
-const server = http.createServer(async (req, res) => {
+const requestHandler = async (req, res) => {
   const requestId = newRequestId();
   const started = Date.now();
   const parsed = url.parse(req.url || '', true);
@@ -342,6 +354,84 @@ const server = http.createServer(async (req, res) => {
         status.rag.ready &&
         status.audit.ready;
       return sendJson(res, 200, status);
+    }
+
+    // ----- mTLS-gated capability issuance / refresh -----
+    // Clients (e.g. Cyberorbit) obtain short-lived, scoped tokens here instead
+    // of holding the signing key. Identity comes from a verified client cert
+    // (direct TLS) or a trusted proxy's forwarded identity; the bearer model on
+    // every other endpoint is unchanged. Disabled endpoints return 404 so we
+    // don't advertise the surface.
+    if (path === '/capability' && req.method === 'POST') {
+      if (!config.capabilityEndpointEnabled) return sendText(res, 404, 'Not found');
+      if (rateLimited(req, res, requestId)) return;
+
+      const identity = clientIdentity(req, config);
+      if (!identity) {
+        audit.record({ action: 'issue_capability', result: 'deny', requestId, detail: { reason: 'no verified client certificate', mode: config.mtlsMode } });
+        res.setHeader('WWW-Authenticate', 'mTLS');
+        return sendJson(res, 401, { error: 'Client certificate required' });
+      }
+      if (!config.privateKeyPem) {
+        return sendJson(res, 503, { error: 'Server not configured to mint tokens (no PRIVATE_KEY)' });
+      }
+
+      let body;
+      try {
+        body = await readJsonBody(req, config.bodyLimitBytes);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+
+      // Optional refresh: a still-valid presented token narrows (never widens)
+      // the new grant. An invalid/expired token is ignored — mTLS is the gate.
+      let priorGrant = null;
+      const presented = (req.headers.authorization || '').replace('Bearer ', '');
+      if (presented && publicKey) {
+        try {
+          const claims = await verifyCapability(presented, publicKey);
+          priorGrant = { domains: claims.jsonam?.domains || [], actions: claims.jsonam?.actions || [] };
+        } catch {
+          /* ignore — issuance is gated by mTLS, not the old token */
+        }
+      }
+
+      let grant;
+      try {
+        grant = boundGrant({
+          requested: { domains: body.domains, actions: body.actions, ttl: body.ttl },
+          policy: capabilityPolicy,
+          priorGrant,
+        });
+      } catch (e) {
+        audit.record({ actor: identity.subject, action: 'issue_capability', result: 'deny', requestId, detail: { reason: e.message, mode: identity.mode } });
+        return sendJson(res, 403, { error: e.message });
+      }
+
+      try {
+        const token = await issueCapability(
+          { domains: grant.domains, actions: grant.actions, subject: identity.subject, ttl: `${grant.ttlSeconds}s` },
+          config.privateKeyPem
+        );
+        audit.record({
+          actor: identity.subject,
+          action: 'issue_capability',
+          result: 'allow',
+          requestId,
+          detail: { mode: identity.mode, fingerprint: identity.fingerprint, domains: grant.domains, actions: grant.actions, ttl: grant.ttlSeconds, refresh: Boolean(priorGrant) },
+        });
+        logger.info('capability_issued', { requestId, actor: identity.subject, mode: identity.mode, actions: grant.actions, ttl: grant.ttlSeconds });
+        return sendJson(res, 201, {
+          token,
+          subject: identity.subject,
+          domains: grant.domains,
+          actions: grant.actions,
+          expiresIn: grant.ttlSeconds,
+        });
+      } catch (e) {
+        logger.error('capability_issue_error', { requestId, error: e.message });
+        return sendJson(res, 500, { error: 'Internal error' });
+      }
     }
 
     // ----- authenticated endpoints (rate-limited) -----
@@ -716,10 +806,31 @@ const server = http.createServer(async (req, res) => {
     logger.error('unhandled_request_error', { requestId, error: e.message, stack: e.stack });
     if (!res.headersSent) sendJson(res, 500, { error: 'Internal error' });
   }
-});
+};
+
+// Direct-mTLS mode upgrades the listener to HTTPS so CARMA terminates TLS and
+// verifies client certs itself. requestCert asks every client for a cert but
+// rejectUnauthorized:false lets uncredentialed traffic (health, UI, bearer
+// endpoints) still connect — only POST /capability requires a verified cert.
+let server;
+if (config.mtlsDirectTls) {
+  server = https.createServer(
+    {
+      cert: config.tlsCertPem,
+      key: config.tlsKeyPem,
+      ca: config.capabilityClientCaPem ? [config.capabilityClientCaPem] : undefined,
+      requestCert: true,
+      rejectUnauthorized: false,
+      minVersion: 'TLSv1.2',
+    },
+    requestHandler
+  );
+} else {
+  server = http.createServer(requestHandler);
+}
 
 server.listen(config.port, () => {
-  logger.info('carma_listening', { port: config.port, config: redactedSummary(config) });
+  logger.info('carma_listening', { port: config.port, tls: config.mtlsDirectTls, config: redactedSummary(config) });
 });
 
 // ---------- lifecycle ----------

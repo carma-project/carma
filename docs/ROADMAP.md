@@ -11,9 +11,9 @@
       verifiable via `verifyEnvelope`.
 - [x] Postgres adapter with migrations — versioned, idempotent migrations
       (`adapters/migrations/*.sql`) applied by `npm run migrate`.
-- [x] JWT capability issuance — `issueCapability` (`server/capability.ts`) + the
-      `npm run mint-token` CLI. (A full mTLS-gated `POST /capability` refresh
-      endpoint per docs/SECURITY.md is still future work.)
+- [x] JWT capability issuance — `issueCapability` (`server/capability.ts`), the
+      `npm run mint-token` CLI, and the mTLS-gated `POST /capability`
+      issuance/refresh endpoint (`server/mtls.js`, `server/capability_issue.js`).
 - [x] MCP server implementation — `store_trace` / `search_memory` tools and
       Postgres-backed resource reads over **stdio and Streamable HTTP**
       (`server/mcp/`, `POST /mcp`). Provider/harness-agnostic; HTTP sessions are
@@ -39,7 +39,9 @@
 - [x] Structured JSON logs + per-request `X-Request-Id`; security headers
 - [x] `/ready` readiness probe; graceful shutdown; crash guards
 - [x] DB SSL modes + pool sizing/timeouts; advisory-locked migrations
-- [ ] mTLS-gated `POST /capability` issuance/refresh
+- [x] mTLS-gated `POST /capability` issuance/refresh — client-cert (direct TLS) or
+      trusted-proxy identity; policy-bounded grants, refresh cannot escalate; off by
+      default (`CAPABILITY_ENDPOINT_ENABLED`). `server/mtls.js`, `server/capability_issue.js`.
 - [ ] iss/aud token checks + resource-pattern glob matching
 - [ ] Serve-path signature auto-verification; KMS/Vault-backed keys + rotation
 

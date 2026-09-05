@@ -7,6 +7,9 @@
 [phases.build]
     cmd = ""
 
+# Apply migrations (idempotent, advisory-locked) before the server starts, so a
+# fresh Railway deploy comes up with a ready schema. Requires a pgvector-enabled
+# Postgres (migration 0002 runs CREATE EXTENSION vector) and DATABASE_URL set.
 [start]
-    cmd = "node --import tsx server/index.js"
+    cmd = "node adapters/migrate.mjs && node --import tsx server/index.js"
     port = 7100

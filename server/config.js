@@ -17,6 +17,37 @@ function toBool(value, def = false) {
   return /^(1|true|yes|on)$/i.test(String(value));
 }
 
+function parseList(value, def = []) {
+  if (value == null || value === '') return def;
+  return String(value)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// Normalize trust-domain refs to trust://<name>; default to the server domain.
+function normDomains(value, trustDomain) {
+  const raw = parseList(value, trustDomain ? [String(trustDomain)] : []);
+  return raw.map((d) => (d.includes('://') ? d : `trust://${d}`));
+}
+
+// SHA-256 fingerprints, compared case-insensitively with ':' stripped.
+function parseFingerprints(value) {
+  return parseList(value).map((f) => f.replace(/:/g, '').toLowerCase());
+}
+
+// Parse a duration to whole seconds. Accepts a bare number (seconds) or a
+// suffixed value: 30s, 15m, 2h, 1d. Falls back to `def` on anything invalid.
+export function parseDurationSeconds(value, def) {
+  if (value == null || value === '') return def;
+  const m = String(value).trim().match(/^(\d+)\s*(s|sec|m|min|h|hr|d)?$/i);
+  if (!m) return def;
+  const n = Number(m[1]);
+  const unit = (m[2] || 's').toLowerCase();
+  const mult = unit.startsWith('d') ? 86400 : unit.startsWith('h') ? 3600 : unit.startsWith('m') ? 60 : 1;
+  return n * mult;
+}
+
 export function parseConfig(env = {}) {
   const cfg = {
     port: toInt(env.PORT, 7100),
@@ -99,6 +130,36 @@ export function parseConfig(env = {}) {
     // available for local harnesses via `npm run mcp`.
     mcpHttpEnabled: toBool(env.MCP_HTTP_ENABLED, true),
     mcpHttpPath: env.MCP_HTTP_PATH || '/mcp',
+    // Capability issuance endpoint (POST /capability): mTLS-gated minting of
+    // short-lived, scoped tokens so clients (e.g. Cyberorbit) request access
+    // without ever holding the signing key. Fail-closed: off unless enabled.
+    capabilityEndpointEnabled: toBool(env.CAPABILITY_ENDPOINT_ENABLED, false),
+    // How the client's verified identity is established:
+    //  'direct' — CARMA terminates TLS and verifies the client cert against
+    //             CAPABILITY_CLIENT_CA (true mTLS; self-hosted / L4 passthrough).
+    //  'proxy'  — a trusted TLS-terminating proxy verifies the client cert and
+    //             forwards the identity via headers, trusted only when the
+    //             request carries the shared CAPABILITY_PROXY_SECRET.
+    mtlsMode: (env.MTLS_MODE || 'direct').toLowerCase(),
+    // Direct mode TLS materials: server cert/key and the CA that must have
+    // signed acceptable client certs.
+    tlsCertPem: env.TLS_CERT || '',
+    tlsKeyPem: env.TLS_KEY || '',
+    capabilityClientCaPem: env.CAPABILITY_CLIENT_CA || '',
+    // Proxy mode: shared secret + header names carrying the verified identity.
+    mtlsProxySecret: env.CAPABILITY_PROXY_SECRET || '',
+    mtlsProxySecretHeader: (env.CAPABILITY_PROXY_SECRET_HEADER || 'x-proxy-authorization').toLowerCase(),
+    mtlsProxySubjectHeader: (env.CAPABILITY_PROXY_SUBJECT_HEADER || 'x-client-subject').toLowerCase(),
+    mtlsProxyVerifyHeader: (env.CAPABILITY_PROXY_VERIFY_HEADER || 'x-client-verify').toLowerCase(),
+    mtlsProxyFingerprintHeader: (env.CAPABILITY_PROXY_FINGERPRINT_HEADER || 'x-client-fingerprint').toLowerCase(),
+    // Policy ceilings for issued tokens. Domains default to the server trust
+    // domain; a bare name is normalized to trust://<name>.
+    capabilityDomains: normDomains(env.CAPABILITY_DOMAINS, env.TRUST_DOMAIN),
+    capabilityMaxActions: parseList(env.CAPABILITY_MAX_ACTIONS, ['read', 'write']),
+    capabilityMaxTtlSeconds: parseDurationSeconds(env.CAPABILITY_MAX_TTL, 900),
+    // Optional allow-list of trusted client-cert SHA-256 fingerprints. When set,
+    // a client identity must present a matching fingerprint (fail-closed).
+    capabilityTrustedFingerprints: parseFingerprints(env.CAPABILITY_TRUSTED_FINGERPRINTS),
     logLevel: (env.LOG_LEVEL || 'info').toLowerCase(),
     hstsEnabled: toBool(env.HSTS_ENABLED, false),
     // If true, boot fails fast when required config is missing/invalid.
@@ -129,6 +190,29 @@ export function parseConfig(env = {}) {
   if (cfg.memoryModelProvider === 'fireworks' && !cfg.fireworksApiKey) {
     cfg.warnings.push('MEMORY_MODEL_PROVIDER=fireworks but FIREWORKS_API_KEY is not set — dream will fall back to local reasoning.');
   }
+  if (cfg.capabilityEndpointEnabled) {
+    if (!['direct', 'proxy'].includes(cfg.mtlsMode)) {
+      cfg.warnings.push(`MTLS_MODE="${cfg.mtlsMode}" invalid; supported: direct, proxy. Falling back to direct.`);
+      cfg.mtlsMode = 'direct';
+    }
+    if (!cfg.privateKeyPem) cfg.warnings.push('CAPABILITY_ENDPOINT_ENABLED but PRIVATE_KEY is not set — POST /capability cannot mint tokens.');
+    if (cfg.mtlsMode === 'direct' && (!cfg.tlsCertPem || !cfg.tlsKeyPem)) {
+      cfg.warnings.push('MTLS_MODE=direct but TLS_CERT/TLS_KEY are not both set — CARMA cannot terminate TLS to verify client certs; POST /capability will 401.');
+    }
+    if (cfg.mtlsMode === 'direct' && !cfg.capabilityClientCaPem) {
+      cfg.warnings.push('MTLS_MODE=direct but CAPABILITY_CLIENT_CA is not set — no client certificates can be verified; POST /capability will 401.');
+    }
+    if (cfg.mtlsMode === 'proxy' && !cfg.mtlsProxySecret) {
+      cfg.warnings.push('MTLS_MODE=proxy but CAPABILITY_PROXY_SECRET is not set — forwarded client identity cannot be trusted; POST /capability will 401.');
+    }
+    if (!cfg.capabilityDomains.length) cfg.warnings.push('CAPABILITY_ENDPOINT_ENABLED but no CAPABILITY_DOMAINS/TRUST_DOMAIN — nothing can be issued.');
+    if (!cfg.capabilityMaxActions.length) cfg.warnings.push('CAPABILITY_MAX_ACTIONS is empty — POST /capability will issue no actions.');
+  }
+
+  // When true, the HTTP listener is upgraded to HTTPS so CARMA can terminate
+  // TLS and verify client certs itself (direct mTLS for POST /capability).
+  cfg.mtlsDirectTls =
+    cfg.capabilityEndpointEnabled && cfg.mtlsMode === 'direct' && Boolean(cfg.tlsCertPem) && Boolean(cfg.tlsKeyPem);
 
   // Node pg SSL config, or false to disable.
   cfg.dbSslConfig =
@@ -152,6 +236,9 @@ export function redactedSummary(cfg) {
     embedDim: cfg.embedDim,
     finetuneProvider: cfg.finetuneProvider,
     mcpHttp: cfg.mcpHttpEnabled ? cfg.mcpHttpPath : false,
+    capability: cfg.capabilityEndpointEnabled
+      ? { mode: cfg.mtlsMode, tls: cfg.mtlsDirectTls ? 'direct' : 'proxy-or-none', domains: cfg.capabilityDomains, maxActions: cfg.capabilityMaxActions, maxTtlSeconds: cfg.capabilityMaxTtlSeconds, fingerprintPinned: cfg.capabilityTrustedFingerprints.length > 0 }
+      : false,
     recall: { sim: cfg.recallWSim, outcome: cfg.recallWOutcome, recency: cfg.recallWRecency, halfLifeDays: cfg.recallHalfLifeDays, pinnedBoost: cfg.recallPinnedBoost, reinforce: cfg.recallWReinforce },
     consolidate: { simThreshold: cfg.consolidateSimThreshold, promoteAt: cfg.reinforcePromoteAt },
     dream: { decayDays: cfg.dreamDecayDays, simThreshold: cfg.dreamSimThreshold, minCluster: cfg.dreamMinClusterSize, model: cfg.memoryModelProvider },

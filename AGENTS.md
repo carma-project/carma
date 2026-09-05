@@ -14,6 +14,9 @@ Guidance for coding agents working on CARMA (JSON-AM reference implementation).
   (provider via `FINETUNE_PROVIDER`; `local` default, `fireworks` for hosted SFT).
 - Consolidate ("dream"): `npm run dream -- --domain acme [--dry-run] [--steps decay,promote,dedup,abstract]`
   (offline batch memory maintenance; memory model via `MEMORY_MODEL_PROVIDER`, `local` default).
+- End-to-end smoke test: `npm run smoke` (reads `PORT`/`TRUST_DOMAIN`/`PRIVATE_KEY`, mints a token
+  in-process, exercises status/ingest/outcome/search/consolidate over `fetch`; no `curl`/`jq` needed,
+  so it runs inside the `node:20-alpine` container). Override with `--url`/`--domain`/`--k`.
 - Tests: `npm test` (unit always; integration + MCP tests run only when `DATABASE_URL` is set).
 
 The entrypoint `server/index.js` imports its middleware/adapters with `.js` specifiers, but
@@ -75,6 +78,16 @@ Production/hardening:
   are missing (recommended in production).
 - `MCP_HTTP_ENABLED` (default `true`) / `MCP_HTTP_PATH` (default `/mcp`) — expose the MCP
   Streamable HTTP transport on the main server so remote agent harnesses can connect.
+- `CAPABILITY_ENDPOINT_ENABLED` (`false`) — enable `POST /capability` (mTLS-gated token
+  issuance/refresh). When enabled:
+  - `MTLS_MODE` (`direct`) — `direct`: CARMA terminates TLS and verifies the client cert against
+    `CAPABILITY_CLIENT_CA` (needs `TLS_CERT`/`TLS_KEY`; upgrades the listener to HTTPS).
+    `proxy`: trust a TLS-terminating proxy's forwarded identity when the request carries
+    `CAPABILITY_PROXY_SECRET` (headers `CAPABILITY_PROXY_SECRET_HEADER`/`_SUBJECT_HEADER`/
+    `_VERIFY_HEADER`/`_FINGERPRINT_HEADER`).
+  - `CAPABILITY_DOMAINS` (default `TRUST_DOMAIN`), `CAPABILITY_MAX_ACTIONS` (default `read,write`),
+    `CAPABILITY_MAX_TTL` (default `15m`) — ceilings for issued grants.
+  - `CAPABILITY_TRUSTED_FINGERPRINTS` — optional allow-list of client-cert SHA-256 fingerprints.
 
 ## Endpoints
 
@@ -84,6 +97,13 @@ Production/hardening:
 - `GET /health` — liveness (always `200` while the process is up).
 - `GET /ready` — readiness (`200` only when it can serve: key valid + DB connected + schema);
   `503` otherwise. Use this for orchestrator readiness probes.
+- `POST /capability` — mTLS-gated capability issuance/refresh (off unless
+  `CAPABILITY_ENDPOINT_ENABLED`). No bearer token; the caller is authenticated by a client cert
+  (direct TLS) or a trusted proxy's forwarded identity. Body: `{ domains?, actions?, ttl? }`
+  (all optional; each is intersected with policy). Optional `Authorization: Bearer <token>`
+  narrows the new grant on refresh (never widens). Returns `{ token, subject, domains, actions,
+  expiresIn }`. `404` when disabled, `401` without a verified client identity. Lets clients
+  (e.g. Cyberorbit) request scoped, short-lived tokens without holding the signing key.
 - `GET /resolve?uri=...` — resolve an envelope by URI (read capability).
 - `POST /memory` — ingest a decision/reasoning trace as a signed `trace://` envelope + recall
   index entry (write capability). Body: `{ task?, content, boundContext?, decision?, outcome?,
@@ -156,9 +176,14 @@ The full stack (app + pgvector Postgres, migrations auto-applied) runs locally v
   A `.dockerignore` keeps `node_modules` and local secrets out of the image.
 - `docker-compose.yml` uses `pgvector/pgvector:pg16` and mounts `adapters/migrations` into
   the DB init dir, so a fresh volume is migrated automatically.
-- Railway uses Nixpacks (`railway.toml` -> `nixpacks.toml`), start `node --import tsx server/index.js`,
-  healthcheck `/health`. Provide `DATABASE_URL`, `PUBLIC_KEY`, `PRIVATE_KEY`; add a pgvector
-  Postgres service and run `npm run migrate`.
+- Railway builds the `Dockerfile` (`railway.toml` sets `builder = "DOCKERFILE"`); the image `CMD`
+  runs `node adapters/migrate.mjs && node --import tsx server/index.js`, so migrations apply on boot
+  (idempotent + advisory-locked); healthcheck `/health`. (`nixpacks.toml` keeps an equivalent
+  Nixpacks start command for non-Docker builders.) Provide `DATABASE_URL`, `PUBLIC_KEY`,
+  `PRIVATE_KEY`, `TRUST_DOMAIN`, and `DATABASE_SSL=require` for managed Postgres over TLS. The
+  Postgres service **must** have pgvector (migration `0002` runs `CREATE EXTENSION vector`).
+  Both `migrate.mjs` and the server honor `DATABASE_SSL` (`disable`|`require`|`verify`).
+  Step-by-step: `docs/DEPLOY_RAILWAY.md`.
 
 ## Production hardening
 

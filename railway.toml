@@ -1,6 +1,10 @@
 [build]
-builder = "NIXPACKS"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
+# The image CMD runs `node adapters/migrate.mjs && <start>`, so a fresh deploy
+# migrates (idempotent + advisory-locked) before serving. Railway injects PORT
+# and the server binds to it; healthcheck is liveness (/ready reports full readiness).
 healthcheckPath = "/health"
 restartPolicyType = "ON_FAILURE"
