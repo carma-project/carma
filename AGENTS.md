@@ -14,6 +14,9 @@ Guidance for coding agents working on CARMA (JSON-AM reference implementation).
   (provider via `FINETUNE_PROVIDER`; `local` default, `fireworks` for hosted SFT).
 - Consolidate ("dream"): `npm run dream -- --domain acme [--dry-run] [--steps decay,promote,dedup,abstract]`
   (offline batch memory maintenance; memory model via `MEMORY_MODEL_PROVIDER`, `local` default).
+- End-to-end smoke test: `npm run smoke` (reads `PORT`/`TRUST_DOMAIN`/`PRIVATE_KEY`, mints a token
+  in-process, exercises status/ingest/outcome/search/consolidate over `fetch`; no `curl`/`jq` needed,
+  so it runs inside the `node:20-alpine` container). Override with `--url`/`--domain`/`--k`.
 - Tests: `npm test` (unit always; integration + MCP tests run only when `DATABASE_URL` is set).
 
 The entrypoint `server/index.js` imports its middleware/adapters with `.js` specifiers, but

@@ -68,6 +68,8 @@ or a connection/SSL error.
 
 ## 5. Verify
 
+From your machine (the app must be publicly exposed):
+
 ```bash
 curl https://<your-app>.up.railway.app/health         # -> ok
 curl https://<your-app>.up.railway.app/ready           # -> 200 when fully ready
@@ -75,6 +77,24 @@ curl https://<your-app>.up.railway.app/api/status | jq # booleans: publicKey, pr
 ```
 
 The built-in configuration UI is at `/` and shows the same readiness diagnostics.
+
+### End-to-end smoke test (from inside the container)
+
+The container image is `node:20-alpine`, which ships without `curl` or `jq`. Instead
+of installing those, run the bundled Node smoke test from the service shell
+(Railway dashboard → your service → Shell, or `railway ssh`):
+
+```sh
+npm run smoke
+```
+
+It reads `PORT`, `TRUST_DOMAIN`, and `PRIVATE_KEY` from the environment, mints a
+short-lived capability token in-process, then exercises the full path against
+`http://localhost:$PORT`: `/api/status` (readiness), `POST /memory` (ingest a
+decision), `POST /outcome` (record the result), `GET /search` (precedent recall,
+confirming the outcome comes back), and `POST /consolidate` (a dream dry-run). It
+prints per-step checks and exits non-zero if any fail. Override the target with
+`--url`, `--domain`, or `--k`, e.g. `npm run smoke -- --k 5`.
 
 ## Troubleshooting
 
