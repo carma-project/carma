@@ -190,3 +190,99 @@ test(
     }
   }
 );
+
+test(
+  'Consolidation & tiers: dedup->review (no silent merge), merge/keep/reject, pin boost, auto-promote',
+  { skip: DB ? false : 'DATABASE_URL not set' },
+  async () => {
+    const { privateKey } = await generateKeyPair('EdDSA', { crv: 'Ed25519', extractable: true });
+    const pkcs8 = await exportPKCS8(privateKey);
+    const adapter = new PostgresAdapter(DB);
+    const dup = 'unauthenticated redis on 6379; module load for remote code execution';
+    const put = (dom, uri, extra = {}) =>
+      storeTrace(adapter, { uri, trustDomain: dom, subject: 't', privateKeyPem: pkcs8 }, { task: 'redis', content: dup, ...extra });
+    try {
+      // --- Tier assignment: confident/important -> consolidated, else working.
+      const tdom = 'tier-' + Date.now();
+      const lowUri = newTraceUri(tdom);
+      const hiUri = newTraceUri(tdom);
+      const low = await put(tdom, lowUri);
+      assert.equal(low.tier, 'working');
+      const hi = await storeTrace(adapter, { uri: hiUri, trustDomain: tdom, subject: 't', privateKeyPem: pkcs8 },
+        { task: 'redis', content: dup + ' (variant)', confidence: 0.9 });
+      assert.equal(hi.tier, 'consolidated');
+
+      // --- Near-duplicate write is queued for review, NOT merged silently.
+      const mdom = 'merge-' + Date.now();
+      const a = newTraceUri(mdom);
+      const b = newTraceUri(mdom);
+      const ra = await put(mdom, a);
+      assert.ok(!ra.reviewQueued, 'first write has no duplicate');
+      const rb = await put(mdom, b);
+      assert.equal(rb.reviewQueued, true, 'near-duplicate is queued for review');
+      assert.equal(rb.similarTo, a);
+      // Both still present until a human decides.
+      let hits = (await adapter.search({ embedding: toVectorLiteral(localEmbed(dup)), k: 10, trustDomain: mdom })).map((r) => r.uri);
+      assert.ok(hits.includes(a) && hits.includes(b));
+      const pending = await adapter.listReviews({ trustDomain: mdom, status: 'pending' });
+      assert.equal(pending.length, 1);
+
+      // merge -> reinforce canonical (a), supersede duplicate (b).
+      const merged = await adapter.resolveReview(pending[0].id, 'merge', { resolver: 'human', promoteAt: 3 });
+      assert.equal(merged.canonical, a);
+      assert.equal(merged.reinforcement, 1);
+      hits = (await adapter.search({ embedding: toVectorLiteral(localEmbed(dup)), k: 10, trustDomain: mdom })).map((r) => r.uri);
+      assert.ok(hits.includes(a) && !hits.includes(b), 'merged duplicate excluded from recall');
+      const rev = await adapter.getReview(pending[0].id);
+      assert.equal(rev.status, 'merged');
+
+      // --- keep_separate -> candidate promoted to consolidated, both recalled.
+      const kdom = 'keep-' + Date.now();
+      const ka = newTraceUri(kdom);
+      const kb = newTraceUri(kdom);
+      await put(kdom, ka);
+      const krb = await put(kdom, kb);
+      await adapter.resolveReview(krb.reviewId, 'keep_separate', { resolver: 'human' });
+      const kbrow = await adapter.query('SELECT tier FROM agent_memory WHERE uri=$1', [kb]);
+      assert.equal(kbrow.rows[0].tier, 'consolidated');
+      const kHits = (await adapter.search({ embedding: toVectorLiteral(localEmbed(dup)), k: 10, trustDomain: kdom })).map((r) => r.uri);
+      assert.ok(kHits.includes(ka) && kHits.includes(kb));
+
+      // --- reject -> candidate retracted (excluded, preserved).
+      const rdom = 'reject-' + Date.now();
+      const rra = newTraceUri(rdom);
+      const rrb = newTraceUri(rdom);
+      await put(rdom, rra);
+      const rrbRes = await put(rdom, rrb);
+      await adapter.resolveReview(rrbRes.reviewId, 'reject', { resolver: 'human' });
+      const rrbrow = await adapter.query('SELECT status FROM agent_memory WHERE uri=$1', [rrb]);
+      assert.equal(rrbrow.rows[0].status, 'retracted');
+      const rHits = (await adapter.search({ embedding: toVectorLiteral(localEmbed(dup)), k: 10, trustDomain: rdom })).map((r) => r.uri);
+      assert.ok(!rHits.includes(rrb));
+
+      // --- Pinned memories get a slight recall boost over equal peers.
+      const pdom = 'pin-' + Date.now();
+      const p = newTraceUri(pdom);
+      const q = newTraceUri(pdom);
+      await put(pdom, p); // stored first (older)
+      await put(pdom, q); // stored later (newer -> higher recency)
+      await adapter.setTier(p, 'pinned');
+      const pRank = await adapter.search({ embedding: toVectorLiteral(localEmbed(dup)), k: 10, trustDomain: pdom, includeInactive: true });
+      assert.equal(pRank[0].uri, p, 'pinned memory outranks an equal, newer, unpinned peer');
+      assert.equal(pRank[0].tier, 'pinned');
+
+      // --- Reinforcement auto-promotes working -> consolidated at threshold.
+      const adom = 'auto-' + Date.now();
+      const au = newTraceUri(adom);
+      await put(adom, au);
+      let r1 = await adapter.reinforce(au, 3);
+      assert.equal(r1.tier, 'working'); // count 1
+      await adapter.reinforce(au, 3); // count 2
+      const r3 = await adapter.reinforce(au, 3); // count 3 -> promote
+      assert.equal(r3.reinforcement_count, 3);
+      assert.equal(r3.tier, 'consolidated');
+    } finally {
+      await adapter.close();
+    }
+  }
+);
