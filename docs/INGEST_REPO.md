@@ -112,6 +112,42 @@ PRIVATE_KEY="$(cat priv.pem)" npm run ingest-git -- \
 
 Flags mirror the markdown importer plus `--branch`, `--since`, `--until`, `--max`, `--no-outcomes`.
 
+## 2c. When CARMA is private (not on the public internet)
+
+The importer makes an **outbound** connection to CARMA, so it just has to run somewhere with
+network access to your CARMA URL. GitHub-hosted Actions runners live on the public internet and
+**cannot reach a private CARMA** — so run the sync inside your network instead. Three options:
+
+1. **Self-hosted GitHub runner (in your network).** Keep [`carma-sync.yml`](examples/carma-sync.yml)
+   but change `runs-on: ubuntu-latest` → `runs-on: self-hosted` (a runner registered inside the VPC
+   that can reach CARMA). Everything else is identical.
+2. **Internal scheduler.** Run [`scripts/sync-repo.sh`](../scripts/sync-repo.sh) from any in-network
+   cron/systemd timer or in-VPC CI. It runs both importers for a checked-out repo:
+   ```sh
+   CARMA_URL=http://carma.internal:7100 TRUST_DOMAIN=cyberorbit \
+   REPO_DIR=/srv/repo REPO_SLUG=cyberorbit/app PRIVATE_KEY="$(cat priv.pem)" \
+     ./scripts/sync-repo.sh            # add --dry-run to preview
+   ```
+3. **Railway cron service (recommended for a Railway deployment).** Build the tiny
+   [`Dockerfile.sync`](examples/Dockerfile.sync) job image (CARMA + `git`) and deploy it as a **cron**
+   service in the *same Railway project* as CARMA. It reaches CARMA over private networking
+   (`http://carma.railway.internal:PORT`) and clones your repo each run
+   ([`sync-entrypoint.sh`](examples/sync-entrypoint.sh)):
+   ```sh
+   docker build -f docs/examples/Dockerfile.sync -t carma-sync .
+   ```
+   Set on the cron service: `REPO_URL`, `CARMA_URL=http://carma.railway.internal:<port>`,
+   `TRUST_DOMAIN`, `PRIVATE_KEY`, and `GIT_TOKEN` (for a private repo). CARMA never leaves the
+   private network.
+
+> **Heads-up:** the git-history importer shells out to `git`, which is **not** in CARMA's
+> `node:20-alpine` runtime image. Use a box/image that has `git` (the `Dockerfile.sync` image adds
+> it); the markdown importer needs only `node`.
+>
+> **Credentials:** write tokens are age-capped (~15 min), so mint per run from `PRIVATE_KEY` rather
+> than storing a long-lived token. If you'd rather not place the signing key in the sync job, front
+> CARMA with an mTLS proxy and issue tokens via `POST /capability` (see `docs/DEPLOY_RAILWAY.md`).
+
 ## 3. How your agents recall it
 
 Any agent/harness recalls precedent the same way — HTTP or MCP, provider-agnostic:

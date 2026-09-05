@@ -29,6 +29,12 @@ Guidance for coding agents working on CARMA (JSON-AM reference implementation).
   decision (author date preserved via `occurredAt`), and reverts record a `failure` outcome on the
   commit they undo. Commits enter the `working` tier (episodic; decay unless recalled), vs. curated
   docs/ADRs which are `consolidated`.
+- Private CARMA (no public internet): the importers dial out to CARMA, so run the sync inside the
+  network. `scripts/sync-repo.sh` runs both importers for one checkout (env: `CARMA_URL`,
+  `TRUST_DOMAIN`, `REPO_DIR`, `REPO_SLUG`, `PRIVATE_KEY`/`CARMA_TOKEN`). For Railway, deploy
+  `docs/examples/Dockerfile.sync` as a cron service in the same project (reaches
+  `carma.railway.internal`). Note: git-history import needs `git`, which is not in the alpine
+  runtime image. See `docs/INGEST_REPO.md` §2c.
 - Tests: `npm test` (unit always; integration + MCP tests run only when `DATABASE_URL` is set).
 
 The entrypoint `server/index.js` imports its middleware/adapters with `.js` specifiers, but

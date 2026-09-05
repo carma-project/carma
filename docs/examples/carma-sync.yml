@@ -27,6 +27,11 @@ on:
 
 jobs:
   sync:
+    # GitHub-hosted runners are on the public internet and CANNOT reach a private
+    # CARMA. If your CARMA is private, register a self-hosted runner inside your
+    # network and use `runs-on: self-hosted` — or skip Actions entirely and run
+    # the sync from inside your network (see docs/INGEST_REPO.md §2c, e.g. a
+    # Railway cron service using docs/examples/Dockerfile.sync).
     runs-on: ubuntu-latest
     steps:
       - name: Checkout knowledge repo

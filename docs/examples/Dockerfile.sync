@@ -1,0 +1,19 @@
+# carma-sync — a small job image that ingests a repo into a PRIVATE CARMA.
+#
+# Build from the CARMA repo root:
+#   docker build -f docs/examples/Dockerfile.sync -t carma-sync .
+#
+# Deploy as a Railway *cron* service in the same project as CARMA so it reaches
+# CARMA over private networking (http://carma.railway.internal:PORT). CARMA stays
+# fully private. Set env: REPO_URL, CARMA_URL, TRUST_DOMAIN, PRIVATE_KEY,
+# and (for private repos) GIT_TOKEN. Optional: GIT_SINCE, REPO_SLUG.
+#
+# Unlike the CARMA runtime image, this one includes `git` (the history importer
+# shells out to it).
+FROM node:20-alpine
+RUN apk add --no-cache git
+WORKDIR /carma
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY . .
+ENTRYPOINT ["sh", "docs/examples/sync-entrypoint.sh"]
