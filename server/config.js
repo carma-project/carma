@@ -1,6 +1,8 @@
 // Central, validated configuration. Parsing is a pure function of an env-like
 // object so it can be unit-tested; the module also exports a default config
 // parsed from process.env.
+import fs from 'node:fs';
+import { parseSources, summarizeSource } from './ingest/sources.js';
 
 function toInt(value, def) {
   const n = Number(value);
@@ -36,6 +38,30 @@ function parseFingerprints(value) {
   return parseList(value).map((f) => f.replace(/:/g, '').toLowerCase());
 }
 
+// Load the raw SOURCES definition from SOURCES_FILE (a path) or SOURCES (inline
+// JSON). Returns the raw array plus any parse error, so warnings stay in one place.
+function loadSourcesRaw(env) {
+  let text = '';
+  if (env.SOURCES_FILE) {
+    try {
+      text = fs.readFileSync(env.SOURCES_FILE, 'utf8');
+    } catch (e) {
+      return { raw: [], error: `SOURCES_FILE unreadable: ${e.message}` };
+    }
+  } else if (env.SOURCES) {
+    text = env.SOURCES;
+  } else {
+    return { raw: [], error: null };
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (!Array.isArray(parsed)) return { raw: [], error: 'SOURCES must be a JSON array of source objects.' };
+    return { raw: parsed, error: null };
+  } catch (e) {
+    return { raw: [], error: `SOURCES invalid JSON: ${e.message}` };
+  }
+}
+
 // Parse a duration to whole seconds. Accepts a bare number (seconds) or a
 // suffixed value: 30s, 15m, 2h, 1d. Falls back to `def` on anything invalid.
 export function parseDurationSeconds(value, def) {
@@ -49,6 +75,7 @@ export function parseDurationSeconds(value, def) {
 }
 
 export function parseConfig(env = {}) {
+  const srcLoad = loadSourcesRaw(env);
   const cfg = {
     port: toInt(env.PORT, 7100),
     trustDomain: env.TRUST_DOMAIN || '',
@@ -160,6 +187,20 @@ export function parseConfig(env = {}) {
     // Optional allow-list of trusted client-cert SHA-256 fingerprints. When set,
     // a client identity must present a matching fingerprint (fail-closed).
     capabilityTrustedFingerprints: parseFingerprints(env.CAPABILITY_TRUSTED_FINGERPRINTS),
+    // Native ingestion: the external systems CARMA pulls context from (git repos
+    // today). Runs in-process like consolidation — no external cron/CI required.
+    // Triggered on demand (POST /ingest) or by the internal scheduler. Each
+    // source may set intervalMinutes to be picked up by the scheduler.
+    sources: parseSources(srcLoad.raw),
+    // Where working checkouts live (cloned once, fast-forwarded thereafter).
+    ingestWorkDir: env.INGEST_WORK_DIR || '/tmp/carma-sources',
+    // Internal scheduler: when enabled, sources with intervalMinutes>0 are pulled
+    // on their cadence. Off by default (POST /ingest still works).
+    ingestSchedulerEnabled: toBool(env.INGEST_SCHEDULER_ENABLED, false),
+    // Pull all sources once shortly after boot (backfill on first deploy).
+    ingestOnBoot: toBool(env.INGEST_ON_BOOT, false),
+    // How often the scheduler wakes to check which sources are due.
+    ingestSchedulerTickMs: toInt(env.INGEST_SCHEDULER_TICK_MS, 60000),
     logLevel: (env.LOG_LEVEL || 'info').toLowerCase(),
     hstsEnabled: toBool(env.HSTS_ENABLED, false),
     // If true, boot fails fast when required config is missing/invalid.
@@ -209,6 +250,21 @@ export function parseConfig(env = {}) {
     if (!cfg.capabilityMaxActions.length) cfg.warnings.push('CAPABILITY_MAX_ACTIONS is empty — POST /capability will issue no actions.');
   }
 
+  if (srcLoad.error) {
+    cfg.warnings.push(srcLoad.error);
+  } else if (srcLoad.raw.length && cfg.sources.length < srcLoad.raw.length) {
+    cfg.warnings.push('Some SOURCES entries were dropped (each needs a unique id and a url/path).');
+  }
+  for (const s of cfg.sources) {
+    if (s.type !== 'git') cfg.warnings.push(`SOURCES: source "${s.id}" type "${s.type}" is unsupported (only "git").`);
+  }
+  if (cfg.sources.length && !cfg.privateKeyPem) {
+    cfg.warnings.push('SOURCES configured but PRIVATE_KEY is not set — ingestion cannot sign memory.');
+  }
+  if (cfg.ingestSchedulerEnabled && !cfg.sources.some((s) => s.intervalMinutes > 0)) {
+    cfg.warnings.push('INGEST_SCHEDULER_ENABLED but no source sets intervalMinutes>0 — the scheduler will do nothing.');
+  }
+
   // When true, the HTTP listener is upgraded to HTTPS so CARMA can terminate
   // TLS and verify client certs itself (direct mTLS for POST /capability).
   cfg.mtlsDirectTls =
@@ -242,6 +298,8 @@ export function redactedSummary(cfg) {
     recall: { sim: cfg.recallWSim, outcome: cfg.recallWOutcome, recency: cfg.recallWRecency, halfLifeDays: cfg.recallHalfLifeDays, pinnedBoost: cfg.recallPinnedBoost, reinforce: cfg.recallWReinforce },
     consolidate: { simThreshold: cfg.consolidateSimThreshold, promoteAt: cfg.reinforcePromoteAt },
     dream: { decayDays: cfg.dreamDecayDays, simThreshold: cfg.dreamSimThreshold, minCluster: cfg.dreamMinClusterSize, model: cfg.memoryModelProvider },
+    sources: cfg.sources.map(summarizeSource),
+    ingest: { scheduler: cfg.ingestSchedulerEnabled, onBoot: cfg.ingestOnBoot, workDir: cfg.ingestWorkDir, tickMs: cfg.ingestSchedulerTickMs },
     tokenMaxAgeRead: cfg.tokenMaxAgeRead,
     tokenMaxAgeWrite: cfg.tokenMaxAgeWrite,
     rateLimit: cfg.rateLimitEnabled ? { rps: cfg.rateLimitRps, burst: cfg.rateLimitBurst } : false,

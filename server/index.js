@@ -15,6 +15,8 @@ import { storeTrace, newTraceUri, recordOutcome, retractMemory } from './ingest.
 import { toPrecedent, weightsFromConfig, policyFromConfig } from './recall.js';
 import { runDistillation, fineTuneStatus } from './distill/pipeline.js';
 import { runDream } from './consolidate/dream.js';
+import { runSource } from './ingest/run.js';
+import { summarizeSource } from './ingest/sources.js';
 import { getMemoryModel } from './memory/model.js';
 import { CARMAMCPServer } from './mcp/index.js';
 import { PostgresAdapter } from '../adapters/postgres.js';
@@ -54,6 +56,36 @@ const capabilityPolicy = {
   maxTtlSeconds: config.capabilityMaxTtlSeconds,
 };
 const limiter = new RateLimiter({ rps: config.rateLimitRps, burst: config.rateLimitBurst });
+
+// Native ingestion state. CARMA pulls configured sources into its own memory
+// in-process (see server/ingest/run.js) — the acquisition counterpart to the
+// dreaming consolidation pass. `ingestBusy` serializes runs so a manual POST
+// /ingest and the scheduler never overlap on the same working checkouts.
+const ingestState = new Map(); // sourceId -> { running, lastRunAt, lastResult, lastError }
+let ingestBusy = false;
+
+async function runSourceTracked(source, opts = {}) {
+  const st = ingestState.get(source.id) || {};
+  st.running = true;
+  ingestState.set(source.id, st);
+  try {
+    const report = await runSource(adapter, config, source, {
+      ...opts,
+      log: (event, detail) => logger.info(event, detail),
+    });
+    st.lastRunAt = report.finishedAt || new Date().toISOString();
+    st.lastResult = { dryRun: report.dryRun, docs: report.docs, commits: report.commits, outcomes: report.outcomes };
+    st.lastError = null;
+    return report;
+  } catch (e) {
+    st.lastRunAt = new Date().toISOString();
+    st.lastError = e.message;
+    throw e;
+  } finally {
+    st.running = false;
+    ingestState.set(source.id, st);
+  }
+}
 
 for (const w of config.warnings) logger.warn('config_warning', { detail: w });
 if (config.strictBoot && (!publicKey || !config.privateKeyPem || !config.databaseUrl)) {
@@ -337,6 +369,21 @@ const requestHandler = async (req, res) => {
         audit: { ready: false },
         mcp: { httpEnabled: config.mcpHttpEnabled, path: config.mcpHttpPath, stdio: true },
         consolidation: { pendingReviews: null },
+        ingest: {
+          scheduler: config.ingestSchedulerEnabled,
+          onBoot: config.ingestOnBoot,
+          busy: ingestBusy,
+          sources: config.sources.map((s) => {
+            const st = ingestState.get(s.id) || {};
+            return {
+              ...summarizeSource(s),
+              running: Boolean(st.running),
+              lastRunAt: st.lastRunAt || null,
+              lastResult: st.lastResult || null,
+              lastError: st.lastError || null,
+            };
+          }),
+        },
       };
       if (config.databaseUrl) {
         try {
@@ -809,6 +856,66 @@ const requestHandler = async (req, res) => {
       }
     }
 
+    // Native ingestion: CARMA pulls a configured source (git repo today) into its
+    // own memory, in-process — no external cron/CI, no round-trip token. This is
+    // the acquisition counterpart to /consolidate (dreaming). Writes memory ->
+    // gated on 'write'. `dryRun` reports counts without storing. `sourceId`
+    // targets one source; omit it to run all.
+    if (path === '/ingest' && req.method === 'POST') {
+      if (rateLimited(req, res, requestId)) return;
+      let body;
+      try {
+        body = await readJsonBody(req, config.bodyLimitBytes);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      const trustDomain = body.trustDomain || config.trustDomain;
+      if (!trustDomain) return sendJson(res, 400, { error: 'trustDomain not set (body.trustDomain or TRUST_DOMAIN)' });
+      let claims;
+      try {
+        claims = await authorize(req, `memory://${trustDomain}/ingest`, 'write');
+      } catch (e) {
+        audit.record({ action: 'ingest', trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+
+      if (!config.sources.length) return sendJson(res, 400, { error: 'No sources configured (set SOURCES or SOURCES_FILE)' });
+      let selected = config.sources;
+      if (body.sourceId) {
+        selected = config.sources.filter((s) => s.id === body.sourceId);
+        if (!selected.length) return sendJson(res, 404, { error: `Unknown sourceId: ${body.sourceId}` });
+      }
+      if (ingestBusy) return sendJson(res, 409, { error: 'Ingestion already in progress' });
+
+      const dryRun = body.dryRun === true;
+      ingestBusy = true;
+      const reports = [];
+      try {
+        for (const source of selected) {
+          try {
+            const report = await runSourceTracked(source, { dryRun, subject: claims.sub });
+            reports.push(report);
+            audit.record({
+              actor: claims.sub,
+              action: 'ingest',
+              trustDomain: report.trustDomain,
+              result: 'allow',
+              requestId,
+              detail: { source: source.id, dryRun, docs: report.docs.count, commits: report.commits.count, outcomes: report.outcomes.count },
+            });
+          } catch (e) {
+            logger.error('ingest_error', { requestId, source: source.id, error: e.message });
+            reports.push({ sourceId: source.id, error: e.message });
+            audit.record({ actor: claims.sub, action: 'ingest', trustDomain, result: 'error', requestId, detail: { source: source.id, error: e.message } });
+          }
+        }
+      } finally {
+        ingestBusy = false;
+      }
+      const failed = reports.some((r) => r.error);
+      return sendJson(res, failed ? 207 : 200, { dryRun, reports });
+    }
+
     return sendText(res, 404, 'Not found');
   } catch (e) {
     logger.error('unhandled_request_error', { requestId, error: e.message, stack: e.stack });
@@ -841,6 +948,54 @@ server.listen(config.port, () => {
   logger.info('carma_listening', { port: config.port, tls: config.mtlsDirectTls, config: redactedSummary(config) });
 });
 
+// ---------- native ingestion scheduler ----------
+// The acquisition side of the memory architecture: on its own cadence CARMA
+// pulls each due source into memory in-process (dreaming later consolidates it).
+// No external cron/CI is required — the standalone container maintains itself.
+let ingestTimer = null;
+
+async function runDueSources(reason, sources) {
+  if (ingestBusy) return;
+  ingestBusy = true;
+  try {
+    for (const source of sources) {
+      try {
+        const r = await runSourceTracked(source, { subject: reason });
+        logger.info('ingest_run', { reason, source: source.id, docs: r.docs.count, commits: r.commits.count, outcomes: r.outcomes.count });
+      } catch (e) {
+        logger.error('ingest_run_error', { reason, source: source.id, error: e.message });
+      }
+    }
+  } finally {
+    ingestBusy = false;
+  }
+}
+
+function dueSources(now) {
+  return config.sources
+    .filter((s) => s.intervalMinutes > 0)
+    .filter((s) => {
+      const st = ingestState.get(s.id);
+      if (!st || !st.lastRunAt) return true;
+      return now - Date.parse(st.lastRunAt) >= s.intervalMinutes * 60000;
+    });
+}
+
+if (config.sources.length && config.ingestOnBoot) {
+  // Slight delay so the listener/DB are ready before the first backfill.
+  setTimeout(() => runDueSources('boot', config.sources).catch(() => {}), 1500).unref();
+}
+if (config.sources.length && config.ingestSchedulerEnabled) {
+  ingestTimer = setInterval(() => {
+    runDueSources('scheduler', dueSources(Date.now())).catch(() => {});
+  }, config.ingestSchedulerTickMs);
+  ingestTimer.unref();
+  logger.info('ingest_scheduler_started', {
+    tickMs: config.ingestSchedulerTickMs,
+    sources: config.sources.filter((s) => s.intervalMinutes > 0).map((s) => s.id),
+  });
+}
+
 // ---------- lifecycle ----------
 
 let shuttingDown = false;
@@ -848,6 +1003,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info('shutdown_start', { signal });
+  if (ingestTimer) clearInterval(ingestTimer);
   server.close(() => {
     adapter.close().finally(() => {
       logger.info('shutdown_complete', {});
