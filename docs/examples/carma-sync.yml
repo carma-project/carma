@@ -1,0 +1,59 @@
+# Example GitHub Actions workflow — copy this into YOUR knowledge repo at
+# .github/workflows/carma-sync.yml to keep CARMA memory in sync with your
+# markdown (agent specs, decision records, "company OS" docs) on every push.
+#
+# It checks out your repo plus the CARMA repo (for the importer), then upserts
+# each markdown section as a signed JSON-AM memory. URIs are deterministic, so
+# re-runs update in place instead of creating duplicates.
+#
+# Secrets to configure in your repo (Settings → Secrets and variables → Actions):
+#   CARMA_URL          e.g. https://carma.up.railway.app
+#   CARMA_PRIVATE_KEY  the Ed25519 PKCS8 PEM (the same PRIVATE_KEY CARMA runs with)
+#
+# Why the private key and not a static token? CARMA age-caps *write* tokens
+# (default 15 min), so a long-lived token stored as a secret would be rejected.
+# The importer mints a fresh short-lived token per run from CARMA_PRIVATE_KEY.
+# (For a stricter setup, front CARMA with an mTLS proxy and use POST /capability
+# instead of shipping the signing key to CI.)
+name: Sync docs to CARMA memory
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.md'
+      - '**/*.mdx'
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout knowledge repo
+        uses: actions/checkout@v4
+
+      - name: Checkout CARMA (importer)
+        uses: actions/checkout@v4
+        with:
+          repository: carma-project/carma
+          path: .carma
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install importer deps
+        run: npm --prefix .carma ci
+
+      - name: Ingest markdown into CARMA
+        env:
+          CARMA_URL: ${{ secrets.CARMA_URL }}
+          PRIVATE_KEY: ${{ secrets.CARMA_PRIVATE_KEY }}
+        run: |
+          cd .carma
+          node --import tsx scripts/ingest-repo.mjs \
+            --dir "$GITHUB_WORKSPACE" \
+            --exclude .carma \
+            --url "$CARMA_URL" \
+            --domain cyberorbit \
+            --repo "${{ github.repository }}"

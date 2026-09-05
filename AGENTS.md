@@ -17,6 +17,12 @@ Guidance for coding agents working on CARMA (JSON-AM reference implementation).
 - End-to-end smoke test: `npm run smoke` (reads `PORT`/`TRUST_DOMAIN`/`PRIVATE_KEY`, mints a token
   in-process, exercises status/ingest/outcome/search/consolidate over `fetch`; no `curl`/`jq` needed,
   so it runs inside the `node:20-alpine` container). Override with `--url`/`--domain`/`--k`.
+- Ingest a repo's markdown (agent specs, decisions/ADRs, "company OS" docs) into memory:
+  `npm run ingest-repo -- --dir <path> --url <carma-url> --domain <domain> [--repo owner/name]
+  [--dry-run] [--no-split] [--exclude a,b]`. Classifies by path/front-matter, splits on `#`/`##`,
+  and upserts each section under a deterministic `trace://<domain>/gh/<repo>/<path>#<slug>` URI
+  (idempotent — safe to re-run per push). Auth via `--token`/`CARMA_TOKEN`, else mints from
+  `PRIVATE_KEY`. Full guide + GitHub Actions sync template: `docs/INGEST_REPO.md`.
 - Tests: `npm test` (unit always; integration + MCP tests run only when `DATABASE_URL` is set).
 
 The entrypoint `server/index.js` imports its middleware/adapters with `.js` specifiers, but

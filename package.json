@@ -12,6 +12,7 @@
     "distill": "node --import tsx scripts/distill.mjs",
     "dream": "node --import tsx scripts/dream.mjs",
     "smoke": "node --import tsx scripts/smoke.mjs",
+    "ingest-repo": "node --import tsx scripts/ingest-repo.mjs",
     "test": "node --import tsx --test test/*.test.mjs"
   },
   "dependencies": {
