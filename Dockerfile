@@ -4,4 +4,6 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 COPY . .
 EXPOSE 7100
-CMD ["node", "--import", "tsx", "server/index.js"]
+# Run migrations (idempotent, advisory-locked) then start. Migrations are skipped
+# if already applied, so this is safe on every boot and across replicas.
+CMD ["sh", "-c", "node adapters/migrate.mjs && node --import tsx server/index.js"]

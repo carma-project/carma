@@ -12,8 +12,14 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
+// Match the server's SSL handling (server/config.js) so migrations work against
+// managed Postgres (Railway/RDS) reached over TLS. 'disable' (default) |
+// 'require' (encrypt, don't verify CA) | 'verify' (verify CA).
+const sslMode = (process.env.DATABASE_SSL || 'disable').toLowerCase();
+const ssl = sslMode === 'disable' ? false : { rejectUnauthorized: sslMode === 'verify' };
+
 const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'migrations');
-const pool = new pg.Pool({ connectionString: DATABASE_URL });
+const pool = new pg.Pool({ connectionString: DATABASE_URL, ssl });
 
 // Serialize migrations across concurrent instances (e.g. rolling deploys) with
 // a session-level advisory lock on a fixed key.
