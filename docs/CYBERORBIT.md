@@ -13,7 +13,13 @@ container — no external cron/CI — and CARMA never needs public exposure.
                └──────── post-train (POST /distill → Fireworks SFT)
                               │
                         a model Cyberorbit owns  ◄── agents recall via MCP / GET /search
+                                                 ◄── agents wake (POST /wake, MCP initialize)
 ```
+
+The three "circadian" operations of the memory architecture: **pull** (ingest) →
+**consolidate** (dream) → **wake** (session-start recall). Wake is what makes a
+Cyberorbit agent boot with its identity + recent decisions intact instead of a
+lossy context summary — the fix for personality/self loss after a compaction.
 
 ## 1. Sources
 
@@ -86,17 +92,33 @@ curl -s -X POST "$CARMA/consolidate" -H "Authorization: Bearer $TOKEN" \
 curl -s -X POST "$CARMA/distill" -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   --data '{"trustDomain":"cyberorbit","kind":"trace","baseModel":"accounts/fireworks/models/llama-v3p1-8b-instruct"}'
+
+# Wake: the brief an agent loads at session start (identity + recent + task-relevant)
+curl -s -X POST "$CARMA/wake" -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  --data '{"trustDomain":"cyberorbit","task":"triage an SSRF finding on the gateway"}'
+# -> { identity[], recent[], relevant[], openReviews, counts, digest }
+# `digest` is the ready-to-inject brief; expect your agent-specs/ADRs under identity[]
+# once the repo has been ingested.
 ```
 
 ## 4. How Cyberorbit agents use it
 
-Recall is provider-neutral — any harness reaches CARMA the same way:
+Recall is provider-neutral — any harness reaches CARMA the same way. The lifecycle
+of a Cyberorbit agent session:
 
-- **MCP** (recommended for agents): point the harness at `POST {MCP_HTTP_PATH}` (`/mcp`) and call
-  `search_memory({ query, k })` for precedent, `store_trace(...)` to write new reasoning at end of
-  turn/session, `record_outcome(...)` when a decision's result is known.
-- **HTTP**: `GET /search?q=…&k=5&domain=cyberorbit` returns precedents ranked by similarity ×
-  outcome × recency, carrying the reasoning, decision, outcome, and lineage.
+1. **Wake (session start).** Connect the harness over **MCP** (`POST {MCP_HTTP_PATH}`, `/mcp`).
+   With `MCP_WAKE_INSTRUCTIONS=true` (default), the `initialize` response already carries the
+   agent's identity + recent decisions as server `instructions`, so a harness that surfaces
+   instructions reloads the agent's self automatically — no call needed. For a task-scoped brief
+   (adds relevant precedent), call the `wake({ task })` tool, or `POST /wake` over HTTP. This is
+   what prevents a context compaction from erasing the agent's personality/self-understanding.
+2. **Recall during the turn.** `search_memory({ query, k })` (MCP) or `GET /search?q=…&k=5&domain=cyberorbit`
+   (HTTP) returns precedents ranked by similarity × outcome × recency, carrying the reasoning,
+   decision, outcome, and lineage.
+3. **Write back.** `store_trace(...)` to record new reasoning/decisions (end of turn/session),
+   and `record_outcome(...)` when a decision's result is known — so what worked resurfaces and
+   the next wake reflects this session's work.
 
 Scoped access without handing out the signing key: enable `POST /capability`
 (mTLS-gated) so Cyberorbit services mint short-lived, least-privilege tokens
