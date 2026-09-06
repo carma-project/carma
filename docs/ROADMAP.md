@@ -148,5 +148,12 @@ the container, no external orchestration required:
 ## Phase 3 - Ecosystem
 - [ ] Federation via ANS
 - [ ] Bridge adapters (Markdown, File)
+- [ ] Optional built-in tailnet mode — an opt-in, env-gated image variant (a userspace
+      `tailscaled`/`tsnet` companion) so a single container can join a tailnet with one
+      env var, for hosts that forbid a kernel `tun` device. Kept out of the core process
+      and off by default: networking stays a pluggable deployment concern (Tailscale,
+      Cloudflare Tunnel, WireGuard, mTLS proxy), never a vendor welded in. Today this is
+      covered by the documented forwarder/sidecar recipes (`docs/EXPOSURE.md`,
+      `docker-compose.tailscale.yml`).
 - [~] Web UI — a built-in configuration/readiness UI ships at `/`; a full
       management UI is still open.

@@ -1,0 +1,86 @@
+# One networking recipe (of several) for running CARMA on a private Tailscale
+# tailnet with NO public listener. This is an EXAMPLE, not a requirement: CARMA is
+# vendor-neutral about how you reach it — a Cloudflare Tunnel, WireGuard, a plain
+# VPC, or an mTLS proxy work equally well. See docs/EXPOSURE.md.
+#
+# What it does: a `tailscale` sidecar joins your tailnet; `carma` shares that
+# sidecar's network namespace, so CARMA is served *on the tailnet* and binds no host
+# port. Only tailnet members (scoped by your ACLs) can reach it.
+#
+# Usage:
+#   1. In the Tailscale admin console, create a *reusable* auth key.
+#   2. Provide it plus your Ed25519 keys and bring the stack up:
+#        TS_AUTHKEY=tskey-auth-... \
+#        PUBLIC_KEY="$(cat public.pem)" PRIVATE_KEY="$(cat private.pem)" \
+#        TRUST_DOMAIN=acme \
+#        docker compose -f docker-compose.tailscale.yml up
+#   3. From any device on the same tailnet, point your MCP client at
+#        http://carma:7100/mcp   (MagicDNS name = the `hostname` below)
+#      with an `Authorization: Bearer <token>` header.
+#
+# Requires a kernel tun device (/dev/net/tun + NET_ADMIN). On hosts that forbid one
+# (some PaaS), use a userspace forwarder instead — e.g. the Railway Tailscale
+# Forwarder template documented in docs/EXPOSURE.md.
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: carma
+      POSTGRES_PASSWORD: carma
+      POSTGRES_DB: carma
+    volumes:
+      # Migrations run in filename order on first initialization of the volume.
+      - ./adapters/migrations:/docker-entrypoint-initdb.d:ro
+      - carma-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U carma -d carma"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    # Becomes CARMA's MagicDNS name on your tailnet (http://carma:7100/mcp).
+    hostname: carma
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?set a reusable Tailscale auth key}
+      # Persist node identity across restarts (avoids duplicate tailnet machines).
+      TS_STATE_DIR: /var/lib/tailscale
+      # Lock the node to a tag your ACLs scope (recommended). Uncomment + define
+      # tag:carma in your tailnet policy to restrict who can dial it.
+      # TS_EXTRA_ARGS: --advertise-tags=tag:carma
+    volumes:
+      - carma-ts:/var/lib/tailscale
+    devices:
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+
+  carma:
+    build: .
+    # Share the tailscale node's network namespace: CARMA is reachable ONLY on the
+    # tailnet (as http://carma:7100), with no host port published to the internet.
+    network_mode: service:tailscale
+    environment:
+      PORT: 7100
+      TRUST_DOMAIN: ${TRUST_DOMAIN:-acme}
+      DATABASE_URL: postgres://carma:carma@db:5432/carma
+      # Expose the MCP Streamable HTTP transport for agent harnesses.
+      MCP_HTTP_ENABLED: "true"
+      # Keep the anonymous surface minimal (see docs/EXPOSURE.md).
+      STATUS_PUBLIC: "false"
+      # Ed25519 keys (PEM). PUBLIC_KEY verifies capability tokens; PRIVATE_KEY signs
+      # stored envelopes. Provide via env / a .env file / a secret manager.
+      PUBLIC_KEY: ${PUBLIC_KEY:-}
+      PRIVATE_KEY: ${PRIVATE_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      tailscale:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  carma-db:
+  carma-ts:
