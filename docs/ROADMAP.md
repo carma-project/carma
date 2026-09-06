@@ -83,6 +83,13 @@
 - [x] Episodic→semantic abstraction — recurring precedents on a task condense into a
       reusable principle (`Semantic` envelope, migration additive) that feeds distillation
       (selectable as `kind=semantic`).
+- [x] "Waking up" — session-start priming (`server/wake/wake.ts`, `POST /wake`, MCP `wake` tool +
+      `memory://<domain>/wake` resource): composes the agent's durable identity (pinned + semantic
+      principles + agent-specs), recent decisions, and (with a task) relevant precedent into a
+      `digest`. The MCP `initialize` response carries that brief as server `instructions`
+      (`MCP_WAKE_INSTRUCTIONS`), so a harness reloads the agent's self on connect — the recall
+      counterpart to ingest (acquire) and dream (consolidate), and the fix for a context-window
+      compaction erasing an agent's personality/self-understanding. Read-only compose (no writes).
 - [ ] Outcome-weighted dataset selection for fine-tuning — prefer success/pinned/reinforced,
       exclude retracted/superseded/failure when building the training corpus.
 - [ ] LLM-assisted resolution is currently *proposal-only*; auto-apply high-confidence NOOP/UPDATE
@@ -107,6 +114,36 @@ Informed by "Mem0: Building Production-Ready AI Agents with Scalable Long-Term M
       multi-hop/temporal precedent queries (Mem0^g helped most on temporal/open-domain).
 - [ ] Eval harness — LLM-as-judge recall-quality eval (LOCOMO-style) to measure precedent
       recall accuracy vs. token/latency cost as weights and consolidation policy change.
+
+## Phase 2.10 - Native ingestion & the sovereign pipeline ✓ (in progress)
+The vision: a standalone CARMA container is not a passive brain but a **sovereign
+AI substrate** a company owns — it pulls context from its own systems, consolidates
+it, and post-trains a model on that distilled reasoning. The whole loop runs *inside*
+the container, no external orchestration required:
+**pull** (ingest) → **consolidate** (dream) → **post-train** (distill).
+- [x] Source registry — connector-agnostic source definitions via `SOURCES` /
+      `SOURCES_FILE` (`server/ingest/sources.ts`), surfaced in `GET /api/status`.
+- [x] Native git connector — CARMA clones/fast-forwards a repo and ingests its
+      markdown **and** git history in-process via `storeTrace` (no HTTP, no token),
+      preserving commit chronology and revert outcomes (`server/ingest/run.ts`,
+      shared extractors in `server/ingest/extract.ts`). Runtime image now ships `git`.
+- [x] Trigger surfaces — on-demand `POST /ingest` (write-gated, `dryRun`, per-source
+      or all) and an internal scheduler (`INGEST_ON_BOOT`, `INGEST_SCHEDULER_ENABLED`,
+      per-source `intervalMinutes`) — the acquisition counterpart to the dream scheduler.
+- [x] Unified extraction — the standalone CLIs (`ingest-repo`/`ingest-git`) and the
+      native engine share one extractor, so external push and internal pull are identical.
+- [x] More connectors — pluggable connector registry (`server/ingest/connectors/`) with
+      `git`, `postgres` (read-only SQL query → memory), `http` (JSON API list → memory), and
+      `github` (issues/PRs + comment threads; merged/closed → outcome signal). Adding a
+      connector never touches the write path. Cyberorbit wiring: `docs/CYBERORBIT.md` +
+      `docs/examples/cyberorbit-sources.json`.
+- [ ] Chat/other connectors (Slack, Linear, Jira) — same registry; likely thin wrappers over `http`.
+- [ ] Incremental/state-aware pulls — persist per-source cursors (last commit/sha,
+      high-water marks) in the DB so scheduled runs only fetch deltas at scale.
+- [ ] Self-driving pipeline — optional post-ingest `dream` + threshold-triggered
+      `distill`, so acquisition → consolidation → post-training runs unattended.
+- [ ] PR/issue ingestion (titles, descriptions, review threads) via the GitHub API —
+      where much of the decision discussion actually lives.
 
 ## Phase 3 - Ecosystem
 - [ ] Federation via ANS

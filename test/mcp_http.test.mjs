@@ -127,7 +127,7 @@ test(
       await rwClient.connect(rwTransport);
       const tools = await rwClient.listTools();
       const names = tools.tools.map((t) => t.name).sort();
-      assert.deepEqual(names, ['record_outcome', 'retract_memory', 'search_memory', 'store_trace']);
+      assert.deepEqual(names, ['record_outcome', 'retract_memory', 'search_memory', 'store_trace', 'wake']);
 
       // 3) Ingest a reasoning trace over HTTP MCP.
       const stored = await rwClient.callTool({

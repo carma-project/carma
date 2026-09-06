@@ -15,6 +15,9 @@ export interface MemoryRecord {
   confidence?: number | null;
   importance?: number | null;
   tier?: string;
+  // Optional historical event time for backfills (e.g. a commit's author date).
+  // When omitted, the row's created_at defaults to now(). Preserved on upsert.
+  createdAt?: string | null;
 }
 
 // Recall ranking weights. Blends semantic similarity with an outcome signal
@@ -96,8 +99,8 @@ export class PostgresAdapter {
     const query = `
       INSERT INTO agent_memory
         (uri, kind, trust_domain, envelope, signature, content, embedding,
-         status, supersedes, outcome_status, outcome_score, confidence, importance, tier)
-      VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10, $11, $12, $13, $14)
+         status, supersedes, outcome_status, outcome_score, confidence, importance, tier, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10, $11, $12, $13, $14, COALESCE($15::timestamptz, now()))
       ON CONFLICT (uri) DO UPDATE SET
         kind = EXCLUDED.kind,
         trust_domain = EXCLUDED.trust_domain,
@@ -128,6 +131,7 @@ export class PostgresAdapter {
       rec.confidence ?? null,
       rec.importance ?? null,
       rec.tier ?? 'working',
+      rec.createdAt ?? null,
     ]);
     return res.rows[0];
   }
@@ -445,6 +449,70 @@ export class PostgresAdapter {
        FROM agent_memory
        WHERE ${where}
        ORDER BY created_at ASC
+       LIMIT $${params.length}`,
+      params
+    );
+    return res.rows;
+  }
+
+  // --- Wake (session-start priming) -----------------------------------------
+
+  // The agent's durable "self": human-pinned memories, abstracted semantic
+  // principles, and ingested agent-specs (boundContext carries `type:agent-spec`).
+  // Ranked so the most identity-defining material comes first. This is what an
+  // agent reloads at the start of a session so a context compaction doesn't
+  // erase who it is / how it operates.
+  async identityMemories(opts: { trustDomain?: string | null; limit?: number } = {}) {
+    const params: any[] = [];
+    let dom = '';
+    if (opts.trustDomain) {
+      params.push(opts.trustDomain);
+      dom = ` AND trust_domain = $${params.length}`;
+    }
+    params.push(Math.min(opts.limit ?? 8, 200));
+    const res = await this.pool.query(
+      `SELECT uri, kind, trust_domain, tier, status, envelope,
+              outcome_status, outcome_score, confidence, importance,
+              reinforcement_count, created_at,
+              CASE
+                WHEN tier = 'pinned' THEN 3
+                WHEN kind = 'semantic' THEN 2
+                WHEN envelope->'boundContext' ? 'type:agent-spec' THEN 1
+                ELSE 0
+              END AS self_priority
+       FROM agent_memory
+       WHERE status = 'active' AND envelope IS NOT NULL${dom}
+         AND (tier = 'pinned' OR kind = 'semantic'
+              OR envelope->'boundContext' ? 'type:agent-spec')
+       ORDER BY self_priority DESC, importance DESC NULLS LAST,
+                reinforcement_count DESC, created_at DESC
+       LIMIT $${params.length}`,
+      params
+    );
+    return res.rows;
+  }
+
+  // The most recent active memories ("what was I just doing"). Newest first.
+  // Outcome envelopes are excluded by default (they aren't episodic decisions).
+  async recentMemories(opts: { trustDomain?: string | null; kinds?: string[]; limit?: number } = {}) {
+    const params: any[] = [];
+    let where = "status = 'active' AND envelope IS NOT NULL";
+    if (opts.trustDomain) {
+      params.push(opts.trustDomain);
+      where += ` AND trust_domain = $${params.length}`;
+    }
+    const kinds = opts.kinds ?? ['trace', 'semantic'];
+    if (kinds.length) {
+      params.push(kinds);
+      where += ` AND kind = ANY($${params.length})`;
+    }
+    params.push(Math.min(opts.limit ?? 8, 200));
+    const res = await this.pool.query(
+      `SELECT uri, kind, trust_domain, tier, status, envelope,
+              outcome_status, outcome_score, reinforcement_count, created_at
+       FROM agent_memory
+       WHERE ${where}
+       ORDER BY created_at DESC
        LIMIT $${params.length}`,
       params
     );

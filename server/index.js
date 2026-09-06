@@ -12,9 +12,12 @@ import { clientIdentity } from './mtls.js';
 import { boundGrant } from './capability_issue.js';
 import { embed, toVectorLiteral } from './embedding.js';
 import { storeTrace, newTraceUri, recordOutcome, retractMemory } from './ingest.js';
-import { toPrecedent, weightsFromConfig, policyFromConfig } from './recall.js';
+import { toPrecedent, weightsFromConfig, policyFromConfig, wakeDefaultsFromConfig } from './recall.js';
+import { composeWake } from './wake/wake.js';
 import { runDistillation, fineTuneStatus } from './distill/pipeline.js';
 import { runDream } from './consolidate/dream.js';
+import { runSource } from './ingest/run.js';
+import { summarizeSource } from './ingest/sources.js';
 import { getMemoryModel } from './memory/model.js';
 import { CARMAMCPServer } from './mcp/index.js';
 import { PostgresAdapter } from '../adapters/postgres.js';
@@ -54,6 +57,36 @@ const capabilityPolicy = {
   maxTtlSeconds: config.capabilityMaxTtlSeconds,
 };
 const limiter = new RateLimiter({ rps: config.rateLimitRps, burst: config.rateLimitBurst });
+
+// Native ingestion state. CARMA pulls configured sources into its own memory
+// in-process (see server/ingest/run.js) — the acquisition counterpart to the
+// dreaming consolidation pass. `ingestBusy` serializes runs so a manual POST
+// /ingest and the scheduler never overlap on the same working checkouts.
+const ingestState = new Map(); // sourceId -> { running, lastRunAt, lastResult, lastError }
+let ingestBusy = false;
+
+async function runSourceTracked(source, opts = {}) {
+  const st = ingestState.get(source.id) || {};
+  st.running = true;
+  ingestState.set(source.id, st);
+  try {
+    const report = await runSource(adapter, config, source, {
+      ...opts,
+      log: (event, detail) => logger.info(event, detail),
+    });
+    st.lastRunAt = report.finishedAt || new Date().toISOString();
+    st.lastResult = { dryRun: report.dryRun, stored: report.stored, byType: report.byType, outcomes: report.outcomes };
+    st.lastError = null;
+    return report;
+  } catch (e) {
+    st.lastRunAt = new Date().toISOString();
+    st.lastError = e.message;
+    throw e;
+  } finally {
+    st.running = false;
+    ingestState.set(source.id, st);
+  }
+}
 
 for (const w of config.warnings) logger.warn('config_warning', { detail: w });
 if (config.strictBoot && (!publicKey || !config.privateKeyPem || !config.databaseUrl)) {
@@ -199,11 +232,33 @@ async function handleMcp(req, res, requestId) {
     if (sid && mcpSessions.delete(sid)) logger.info('mcp_session_close', { sessionId: sid });
   };
 
+  // Compose the wake brief once, up front, so it can ride along on the MCP
+  // `initialize` response as server `instructions`. The harness then reloads the
+  // agent's identity/self on connect — the fix for losing personality to a
+  // context compaction. Best-effort: a failure here must not block the session.
+  let instructions;
+  if (config.mcpWakeInstructions && grant.actions.includes('read')) {
+    try {
+      const wakeDefaults = wakeDefaultsFromConfig(config);
+      const brief = await composeWake(adapter, {
+        trustDomain: config.trustDomain,
+        recent: wakeDefaults.recent,
+        identity: wakeDefaults.identity,
+        recallWeights: weightsFromConfig(config),
+      });
+      if (brief.counts.identity > 0 || brief.counts.recent > 0) instructions = brief.digest;
+    } catch (e) {
+      logger.warn('mcp_wake_instructions_failed', { requestId, error: e.message });
+    }
+  }
+
   const carma = new CARMAMCPServer(adapter, {
     trustDomain: config.trustDomain,
     privateKeyPem: config.privateKeyPem,
     allowedActions: grant.actions,
     recallWeights: weightsFromConfig(config),
+    wake: wakeDefaultsFromConfig(config),
+    instructions,
   });
   await carma.server.connect(transport);
   return transport.handleRequest(req, res);
@@ -245,7 +300,15 @@ function validateTraceInput(body) {
   let supersedes = null;
   if (body.supersedes != null) supersedes = sanitizeUri(body.supersedes);
 
-  return { task, content, boundContext, decision, outcome, confidence, importance, supersedes };
+  let occurredAt = null;
+  if (body.occurredAt != null) {
+    if (typeof body.occurredAt !== 'string' || Number.isNaN(Date.parse(body.occurredAt))) {
+      throw new Error('occurredAt must be an ISO 8601 date string');
+    }
+    occurredAt = new Date(body.occurredAt).toISOString();
+  }
+
+  return { task, content, boundContext, decision, outcome, confidence, importance, supersedes, occurredAt };
 }
 
 const OUTCOME_STATUSES = ['pending', 'success', 'failure', 'mixed', 'unknown'];
@@ -327,8 +390,24 @@ const requestHandler = async (req, res) => {
         database: { configured: Boolean(config.databaseUrl), connected: false, schemaReady: false },
         rag: { ready: false },
         audit: { ready: false },
-        mcp: { httpEnabled: config.mcpHttpEnabled, path: config.mcpHttpPath, stdio: true },
+        mcp: { httpEnabled: config.mcpHttpEnabled, path: config.mcpHttpPath, stdio: true, wakeInstructions: config.mcpWakeInstructions },
+        wake: { recent: config.wakeRecent, identity: config.wakeIdentity, relevant: config.wakeRelevant },
         consolidation: { pendingReviews: null },
+        ingest: {
+          scheduler: config.ingestSchedulerEnabled,
+          onBoot: config.ingestOnBoot,
+          busy: ingestBusy,
+          sources: config.sources.map((s) => {
+            const st = ingestState.get(s.id) || {};
+            return {
+              ...summarizeSource(s),
+              running: Boolean(st.running),
+              lastRunAt: st.lastRunAt || null,
+              lastResult: st.lastResult || null,
+              lastError: st.lastError || null,
+            };
+          }),
+        },
       };
       if (config.databaseUrl) {
         try {
@@ -521,6 +600,49 @@ const requestHandler = async (req, res) => {
         return sendJson(res, 200, { query: q, count: results.length, results });
       } catch (e) {
         logger.error('search_error', { requestId, error: e.message });
+        return sendJson(res, 500, { error: 'Internal error' });
+      }
+    }
+
+    // Wake (session-start priming): compose the agent's durable identity/self
+    // (pinned + semantic principles + agent-specs), its most recent decisions,
+    // and — when a `task` is given — the top precedents for it, into a brief the
+    // agent loads at the start of a session so a context compaction doesn't erase
+    // who it is. Read-only compose (no writes/signing) -> gated on 'read'.
+    if (path === '/wake' && (req.method === 'POST' || req.method === 'GET')) {
+      if (rateLimited(req, res, requestId)) return;
+      let body = {};
+      if (req.method === 'POST') {
+        try {
+          body = await readJsonBody(req, config.bodyLimitBytes);
+        } catch (e) {
+          return sendJson(res, 400, { error: e.message });
+        }
+      }
+      const domain = body.trustDomain || parsed.query.domain || config.trustDomain;
+      if (!domain) return sendJson(res, 400, { error: 'trustDomain not set (body.trustDomain, ?domain, or TRUST_DOMAIN)' });
+      const task = body.task ?? parsed.query.task ?? null;
+      let claims;
+      try {
+        claims = await authorize(req, `memory://${domain}/wake`, 'read');
+      } catch (e) {
+        audit.record({ action: 'wake', trustDomain: domain, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+      try {
+        const wakeDefaults = wakeDefaultsFromConfig(config);
+        const payload = await composeWake(adapter, {
+          trustDomain: domain,
+          task,
+          recent: body.recent != null ? Math.min(Number(body.recent), config.searchKMax) : wakeDefaults.recent,
+          identity: body.identity != null ? Math.min(Number(body.identity), config.searchKMax) : wakeDefaults.identity,
+          relevant: body.relevant != null ? Math.min(Number(body.relevant), config.searchKMax) : wakeDefaults.relevant,
+          recallWeights: weightsFromConfig(config),
+        });
+        audit.record({ actor: claims.sub, action: 'wake', trustDomain: domain, result: 'allow', requestId, detail: { task: task ? String(task).slice(0, 80) : null, ...payload.counts, openReviews: payload.openReviews } });
+        return sendJson(res, 200, payload);
+      } catch (e) {
+        logger.error('wake_error', { requestId, error: e.message });
         return sendJson(res, 500, { error: 'Internal error' });
       }
     }
@@ -801,6 +923,66 @@ const requestHandler = async (req, res) => {
       }
     }
 
+    // Native ingestion: CARMA pulls a configured source (git repo today) into its
+    // own memory, in-process — no external cron/CI, no round-trip token. This is
+    // the acquisition counterpart to /consolidate (dreaming). Writes memory ->
+    // gated on 'write'. `dryRun` reports counts without storing. `sourceId`
+    // targets one source; omit it to run all.
+    if (path === '/ingest' && req.method === 'POST') {
+      if (rateLimited(req, res, requestId)) return;
+      let body;
+      try {
+        body = await readJsonBody(req, config.bodyLimitBytes);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      const trustDomain = body.trustDomain || config.trustDomain;
+      if (!trustDomain) return sendJson(res, 400, { error: 'trustDomain not set (body.trustDomain or TRUST_DOMAIN)' });
+      let claims;
+      try {
+        claims = await authorize(req, `memory://${trustDomain}/ingest`, 'write');
+      } catch (e) {
+        audit.record({ action: 'ingest', trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
+        return sendText(res, 403, 'Forbidden: ' + e.message);
+      }
+
+      if (!config.sources.length) return sendJson(res, 400, { error: 'No sources configured (set SOURCES or SOURCES_FILE)' });
+      let selected = config.sources;
+      if (body.sourceId) {
+        selected = config.sources.filter((s) => s.id === body.sourceId);
+        if (!selected.length) return sendJson(res, 404, { error: `Unknown sourceId: ${body.sourceId}` });
+      }
+      if (ingestBusy) return sendJson(res, 409, { error: 'Ingestion already in progress' });
+
+      const dryRun = body.dryRun === true;
+      ingestBusy = true;
+      const reports = [];
+      try {
+        for (const source of selected) {
+          try {
+            const report = await runSourceTracked(source, { dryRun, subject: claims.sub });
+            reports.push(report);
+            audit.record({
+              actor: claims.sub,
+              action: 'ingest',
+              trustDomain: report.trustDomain,
+              result: 'allow',
+              requestId,
+              detail: { source: source.id, dryRun, stored: report.stored.count, failed: report.stored.failed, outcomes: report.outcomes.count, byType: report.byType },
+            });
+          } catch (e) {
+            logger.error('ingest_error', { requestId, source: source.id, error: e.message });
+            reports.push({ sourceId: source.id, error: e.message });
+            audit.record({ actor: claims.sub, action: 'ingest', trustDomain, result: 'error', requestId, detail: { source: source.id, error: e.message } });
+          }
+        }
+      } finally {
+        ingestBusy = false;
+      }
+      const failed = reports.some((r) => r.error);
+      return sendJson(res, failed ? 207 : 200, { dryRun, reports });
+    }
+
     return sendText(res, 404, 'Not found');
   } catch (e) {
     logger.error('unhandled_request_error', { requestId, error: e.message, stack: e.stack });
@@ -833,6 +1015,54 @@ server.listen(config.port, () => {
   logger.info('carma_listening', { port: config.port, tls: config.mtlsDirectTls, config: redactedSummary(config) });
 });
 
+// ---------- native ingestion scheduler ----------
+// The acquisition side of the memory architecture: on its own cadence CARMA
+// pulls each due source into memory in-process (dreaming later consolidates it).
+// No external cron/CI is required — the standalone container maintains itself.
+let ingestTimer = null;
+
+async function runDueSources(reason, sources) {
+  if (ingestBusy) return;
+  ingestBusy = true;
+  try {
+    for (const source of sources) {
+      try {
+        const r = await runSourceTracked(source, { subject: reason });
+        logger.info('ingest_run', { reason, source: source.id, stored: r.stored.count, failed: r.stored.failed, outcomes: r.outcomes.count });
+      } catch (e) {
+        logger.error('ingest_run_error', { reason, source: source.id, error: e.message });
+      }
+    }
+  } finally {
+    ingestBusy = false;
+  }
+}
+
+function dueSources(now) {
+  return config.sources
+    .filter((s) => s.intervalMinutes > 0)
+    .filter((s) => {
+      const st = ingestState.get(s.id);
+      if (!st || !st.lastRunAt) return true;
+      return now - Date.parse(st.lastRunAt) >= s.intervalMinutes * 60000;
+    });
+}
+
+if (config.sources.length && config.ingestOnBoot) {
+  // Slight delay so the listener/DB are ready before the first backfill.
+  setTimeout(() => runDueSources('boot', config.sources).catch(() => {}), 1500).unref();
+}
+if (config.sources.length && config.ingestSchedulerEnabled) {
+  ingestTimer = setInterval(() => {
+    runDueSources('scheduler', dueSources(Date.now())).catch(() => {});
+  }, config.ingestSchedulerTickMs);
+  ingestTimer.unref();
+  logger.info('ingest_scheduler_started', {
+    tickMs: config.ingestSchedulerTickMs,
+    sources: config.sources.filter((s) => s.intervalMinutes > 0).map((s) => s.id),
+  });
+}
+
 // ---------- lifecycle ----------
 
 let shuttingDown = false;
@@ -840,6 +1070,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info('shutdown_start', { signal });
+  if (ingestTimer) clearInterval(ingestTimer);
   server.close(() => {
     adapter.close().finally(() => {
       logger.info('shutdown_complete', {});

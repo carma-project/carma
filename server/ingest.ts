@@ -32,6 +32,11 @@ export interface TraceInput {
   importance?: number | null;
   // When set, this trace is a revision that supersedes the given memory URI.
   supersedes?: string | null;
+  // Optional event time (ISO 8601) for historical backfills, e.g. a commit's
+  // author date. Sets the envelope's issuedAt and the stored row's created_at
+  // (which recall's recency decay reads), so imported history keeps its real
+  // chronology. Defaults to now(). provenance.createdAt still records ingest time.
+  occurredAt?: string | null;
 }
 
 // Derive a signed usefulness signal in [-1, 1] from an outcome, so recall can
@@ -86,6 +91,16 @@ export async function storeTrace(adapter: any, ctx: IngestContext, input: TraceI
   if (!ctx.privateKeyPem) throw new Error('Server missing PRIVATE_KEY for signing');
 
   const now = new Date().toISOString();
+  // Event time for historical backfills (e.g. a commit's author date); falls
+  // back to ingest time. Normalized to canonical ISO here so the in-process
+  // path matches the HTTP path (which normalizes in validateTraceInput); an
+  // unparseable value is ignored rather than corrupting the envelope.
+  let occurredAt: string | null = null;
+  if (input?.occurredAt) {
+    const d = new Date(input.occurredAt);
+    if (!Number.isNaN(d.getTime())) occurredAt = d.toISOString();
+  }
+  const issuedAt = occurredAt || now;
   const envelope: any = {
     '@context': 'https://json-am.org/context/v0.1',
     id: ctx.uri,
@@ -93,7 +108,7 @@ export async function storeTrace(adapter: any, ctx: IngestContext, input: TraceI
     uriScheme: 'trace',
     trustDomain: ctx.trustDomain,
     version: '0.1.3-draft',
-    issuedAt: now,
+    issuedAt,
     provenance: { createdBy: ctx.subject ?? 'carma', createdAt: now },
     task,
     boundContext,
@@ -128,6 +143,7 @@ export async function storeTrace(adapter: any, ctx: IngestContext, input: TraceI
     confidence: typeof input?.confidence === 'number' ? input.confidence : null,
     importance: typeof input?.importance === 'number' ? input.importance : null,
     tier,
+    createdAt: occurredAt,
   });
 
   // Revision: mark the prior version superseded so recall returns only the head.

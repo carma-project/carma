@@ -41,6 +41,15 @@ export function weightsFromConfig(config: any) {
   };
 }
 
+// Wake layer sizes derived from config (server/config.js).
+export function wakeDefaultsFromConfig(config: any) {
+  return {
+    recent: config?.wakeRecent,
+    identity: config?.wakeIdentity,
+    relevant: config?.wakeRelevant,
+  };
+}
+
 // Consolidation policy (on-write) derived from config.
 export function policyFromConfig(config: any) {
   return {

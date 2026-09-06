@@ -17,6 +17,34 @@ Guidance for coding agents working on CARMA (JSON-AM reference implementation).
 - End-to-end smoke test: `npm run smoke` (reads `PORT`/`TRUST_DOMAIN`/`PRIVATE_KEY`, mints a token
   in-process, exercises status/ingest/outcome/search/consolidate over `fetch`; no `curl`/`jq` needed,
   so it runs inside the `node:20-alpine` container). Override with `--url`/`--domain`/`--k`.
+- **Native ingestion (recommended): CARMA pulls sources itself, in-process** — no external
+  cron/CI. Declare `SOURCES` (JSON) — git repos, Postgres/SQL, HTTP JSON APIs, and GitHub
+  issues/PRs (see Configuration) — and either trigger `POST /ingest` (write; body
+  `{ sourceId?, dryRun? }`) or enable the scheduler (`INGEST_ON_BOOT` / `INGEST_SCHEDULER_ENABLED`
+  + per-source `intervalMinutes`). CARMA collects each source and stores memory via `storeTrace`
+  directly (signed with the server `PRIVATE_KEY`; no token minted). This is the acquisition
+  counterpart to `dream`, closing the loop **pull → consolidate → post-train** inside the
+  container. Git ingestion shares extractors with the CLIs below. See `docs/INGEST_REPO.md` §0.
+- Ingest a repo's markdown (agent specs, decisions/ADRs, "company OS" docs) into memory *from
+  outside* (push via `POST /memory`; for air-gapped sources or ad-hoc backfills):
+  `npm run ingest-repo -- --dir <path> --url <carma-url> --domain <domain> [--repo owner/name]
+  [--dry-run] [--no-split] [--exclude a,b]`. Classifies by path/front-matter, splits on `#`/`##`,
+  and upserts each section under a deterministic `trace://<domain>/gh/<repo>/<path>#<slug>` URI
+  (idempotent — safe to re-run per push). Auth via `--token`/`CARMA_TOKEN`, else mints from
+  `PRIVATE_KEY`. Full guide + GitHub Actions sync template: `docs/INGEST_REPO.md`.
+- Ingest a repo's **git history** (the reasoning behind every change): `npm run ingest-git -- --dir
+  <path> --url <carma-url> --domain <domain> [--repo owner/name] [--since "30 days ago"] [--branch b]
+  [--max N] [--dry-run]`. Each commit becomes a dated `trace://<domain>/gh/<repo>/commit/<sha>`
+  decision (author date preserved via `occurredAt`), and reverts record a `failure` outcome on the
+  commit they undo. Commits enter the `working` tier (episodic; decay unless recalled), vs. curated
+  docs/ADRs which are `consolidated`.
+- Private CARMA (no public internet): prefer **native ingestion** above — if CARMA can reach the
+  repo it needs no external runner. Otherwise the importers dial out to CARMA, so run the sync
+  inside the network: `scripts/sync-repo.sh` runs both importers for one checkout (env: `CARMA_URL`,
+  `TRUST_DOMAIN`, `REPO_DIR`, `REPO_SLUG`, `PRIVATE_KEY`/`CARMA_TOKEN`). For Railway, deploy
+  `docs/examples/Dockerfile.sync` as a cron service in the same project (reaches
+  `carma.railway.internal`). The CARMA runtime image now includes `git` (needed for the native and
+  history importers). See `docs/INGEST_REPO.md` §2c.
 - Tests: `npm test` (unit always; integration + MCP tests run only when `DATABASE_URL` is set).
 
 The entrypoint `server/index.js` imports its middleware/adapters with `.js` specifiers, but
@@ -72,12 +100,38 @@ Production/hardening:
   used for consolidation reasoning (near-duplicate proposals + episodic→semantic gisting). `local` is
   deterministic and offline; `fireworks` uses an OpenAI-compatible chat endpoint and falls back to
   local on any error. Provider-neutral — bring any backend.
+Native ingestion (sources CARMA pulls itself):
+- `SOURCES` (inline JSON array) or `SOURCES_FILE` (path to that JSON) — source definitions, one per
+  connector. Pluggable connectors live in `server/ingest/connectors/` (registry in `index.ts`); the
+  common write path is `server/ingest/run.ts`. `intervalMinutes>0` makes a source eligible for the
+  scheduler. Supported `type`s:
+  - `git` — `{ id, type:"git", url|path, repo?, branch?, since?, docs?, history?, maxCommits?, exclude?, tokenEnv? }`.
+    Ingests markdown (specs/decisions/OS docs) + full commit history (reverts → failure outcome).
+  - `postgres` — `{ id, type:"postgres", dsnEnv|dsn, query, ssl?, columns:{id,title,content,date?,decision?}, confidence?, importance? }`.
+    Runs a read-only SQL query; each row → a memory. Use a read-only role; prefer `dsnEnv`.
+  - `http` — `{ id, type:"http", url, headers?, tokenEnv?, itemsPath?, fields:{id,title,content,date?,decision?}, confidence?, importance? }`.
+    GETs a JSON list (at `itemsPath`) and maps each record.
+  - `github` — `{ id, type:"github", repo:"owner/name", tokenEnv?, apiBase?, state?, since?, maxPages?, includeComments?, maxComments? }`.
+    Ingests issues + PRs (with comment threads); merged PR → success, "not planned" → failure.
+  Secrets (`dsn`, `url`, `query`, tokens) never appear in `/api/status` or logs. See `docs/INGEST_REPO.md`;
+  a full Cyberorbit wiring is in `docs/CYBERORBIT.md` + `docs/examples/cyberorbit-sources.json`.
+- `INGEST_WORK_DIR` (`/tmp/carma-sources`) — where checkouts are cloned/cached (fast-forwarded on re-run).
+- `INGEST_ON_BOOT` (`false`) — pull all sources once shortly after startup (first-deploy backfill).
+- `INGEST_SCHEDULER_ENABLED` (`false`) / `INGEST_SCHEDULER_TICK_MS` (`60000`) — run due sources on
+  their `intervalMinutes` cadence. Runs are serialized (a manual `POST /ingest` and the scheduler
+  never overlap). `GET /api/status` reports each source and its last run under `ingest.sources[]`.
 - `LOG_LEVEL` (`info`) — structured JSON logs; each request gets an `X-Request-Id`.
 - `HSTS_ENABLED` (`false`) — send HSTS (enable when TLS terminates at/after the proxy).
 - `STRICT_BOOT` (`false`) — fail fast at startup if `PUBLIC_KEY`/`PRIVATE_KEY`/`DATABASE_URL`
   are missing (recommended in production).
 - `MCP_HTTP_ENABLED` (default `true`) / `MCP_HTTP_PATH` (default `/mcp`) — expose the MCP
   Streamable HTTP transport on the main server so remote agent harnesses can connect.
+- `WAKE_RECENT` (`5`) / `WAKE_IDENTITY` (`8`) / `WAKE_RELEVANT` (`5`) — layer sizes for the
+  session-start "wake" brief (`POST /wake`, MCP `wake` tool, `memory://<domain>/wake` resource):
+  how many recent decisions, identity/self memories, and (when a task is given) relevant precedents.
+- `MCP_WAKE_INSTRUCTIONS` (`true`) — carry the agent's identity+recent wake brief as the MCP
+  `initialize` response's `instructions`, so a harness reloads the agent's self on connect
+  (surviving a context-window compaction). Set `false` to opt out (the `wake` tool/resource still work).
 - `CAPABILITY_ENDPOINT_ENABLED` (`false`) — enable `POST /capability` (mTLS-gated token
   issuance/refresh). When enabled:
   - `MTLS_MODE` (`direct`) — `direct`: CARMA terminates TLS and verifies the client cert against
@@ -114,6 +168,12 @@ Production/hardening:
 - `POST /retract` — exclude a memory from recall, preserved for audit (write). Body: `{ uri, reason? }`.
 - `GET /search?q=...&k=5&domain=acme` — precedent recall (read): returns precedents (reasoning,
   decision, outcome, lineage) ranked by similarity × outcome × recency; excludes superseded/retracted.
+- `POST /wake` (or `GET /wake?domain=&task=`) — session-start "wake" brief (read): composes the
+  agent's durable identity (pinned + semantic principles + agent-specs), most recent decisions, and —
+  when `task` is given — the top precedents for it. Body: `{ trustDomain?, task?, recent?, identity?,
+  relevant? }`. Returns `{ trustDomain, identity[], recent[], relevant[], openReviews, counts, digest }`
+  where `digest` is a ready-to-inject natural-language brief. Read this at the start of a session (or
+  after a context compaction) instead of relying on a summarized context window.
 - `POST /pin` — pin/unpin a memory (write). Body: `{ uri, pinned? }` (default `true`). Pinned
   memories are boosted in recall and exempt from decay/eviction (see Consolidation & tiers).
 - `GET /reviews?domain=acme&status=pending` — list consolidation reviews (near-duplicate merge
@@ -126,6 +186,11 @@ Production/hardening:
   Returns a report: memories archived (decay), promoted (tier recompute), near-duplicate reviews
   raised (each with a model-proposed resolution), and semantic memories abstracted. `dryRun:true`
   reports intended changes without mutating.
+- `POST /ingest` — native ingestion: pull a configured source into memory in-process (write). Body:
+  `{ sourceId?, dryRun?, trustDomain? }` (omit `sourceId` to run all). Clones/updates the git source
+  and stores its markdown + history via `storeTrace`; `dryRun:true` reports counts without writing.
+  Returns `{ dryRun, reports:[{ sourceId, repo, docs, commits, outcomes }] }`. `409` if a run is
+  already in progress; `404` for an unknown `sourceId`.
 - `POST /distill` — distill stored reasoning/memory into a fine-tune job (capability action
   `distill`). Body: `{ trustDomain?, kind?, since?, limit?, format?, baseModel?, suffix? }`.
   Returns `{ datasetUri, examples, provider, baseModel, jobId, status, model }`.
@@ -139,8 +204,14 @@ Production/hardening:
 CARMA is not tied to a specific framework or model provider, it speaks the open protocol.
 Tools: `store_trace({ task, content, boundContext, decision?, outcome?, confidence?, importance?,
 supersedes? })`, `record_outcome({ decisionUri, status, score?, evidence? })`,
-`retract_memory({ uri, reason? })`, and `search_memory({ query, k })` (precedent recall);
-plus resource reads (`memory://<domain>/*`). Envelope schema: JSON-AM v0.1.3-draft (`docs/JSON-AM.md`).
+`retract_memory({ uri, reason? })`, `search_memory({ query, k })` (precedent recall), and
+`wake({ task?, recent?, identity?, relevant? })` (session-start priming); plus resource reads
+(`memory://<domain>/*`, and the composed `memory://<domain>/wake` brief). Envelope schema:
+JSON-AM v0.1.3-draft (`docs/JSON-AM.md`).
+
+On connect, an authenticated session's `initialize` response carries the wake brief as the server
+`instructions` (unless `MCP_WAKE_INSTRUCTIONS=false`), so a harness that surfaces instructions
+reloads the agent's identity/self automatically — the fix for losing personality to a compaction.
 
 - **stdio** (`npm run mcp`) — for local harnesses (Claude Desktop, Cursor, LangGraph, custom
   SDK clients). A stdio connection is a trusted local channel: it operates under `TRUST_DOMAIN`,
@@ -228,6 +299,29 @@ Modeled on how human memory keeps salient material and lets the rest fade. Colum
   `Semantic` memory (episodic→semantic) that also feeds distillation. `dryRun` reports without
   mutating. The reasoning (proposals + gisting) uses the pluggable, provider-neutral memory model
   (`server/memory/model.ts`); `local` is deterministic/offline.
+
+## Wake (session-start priming)
+
+The recall counterpart to **ingest** (acquisition) and **dream** (consolidation) — the three
+"circadian" operations of the memory architecture. A fresh session (or a context-window compaction
+that summarizes away the working state) makes an agent lose its sense of self: who it is, how it
+operates, what it was just doing. **Wake** reconstitutes that from *durable memory* instead of a
+lossy summary. `composeWake` (`server/wake/wake.ts`) assembles three layers for a trust domain:
+
+- **identity** — the agent's durable self: human-pinned memories, abstracted `Semantic` principles,
+  and ingested agent-specs (`boundContext` carries `type:agent-spec`), ranked so the most
+  identity-defining material comes first (`PostgresAdapter.identityMemories`). This is the part a
+  compaction must never erase.
+- **recent** — the most recent active decisions, newest first ("what was I just doing";
+  `PostgresAdapter.recentMemories`), de-duplicated against the identity layer.
+- **relevant** — when the session has a `task`, the top precedents for it (the same
+  similarity × outcome × recency recall as `/search`), so the agent wakes already oriented.
+
+It returns the structured layers plus a `digest` — a ready-to-inject natural-language brief. Wake is
+a **read-only compose** (no writes, no signing, like `/search`), so it is cheap and safe to run on
+every connect. Surfaces: `POST /wake` (read), the MCP `wake` tool and `memory://<domain>/wake`
+resource, and — most importantly — the MCP `initialize` `instructions` (so a harness reloads the
+agent's self on connect without an explicit tool call; toggle with `MCP_WAKE_INSTRUCTIONS`).
 
 ## Cursor Cloud specific instructions
 
