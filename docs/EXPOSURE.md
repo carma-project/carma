@@ -52,6 +52,49 @@ Nothing about CARMA is publicly reachable in this model; the connectors it uses 
 ingest are **outbound** (git/DB/GitHub/HTTP), so no inbound exposure is required
 for ingestion either.
 
+### Reaching a private CARMA from off-network agents
+
+Two concrete recipes for the overlay above; both keep CARMA with **no public port**.
+CARMA is agnostic to which you use (or neither, for in-VPC agents that reach the
+private address directly) — networking is a pluggable deployment concern, not a
+built-in.
+
+**Railway — Tailscale Forwarder (managed sidecar).** When CARMA runs on Railway
+private networking (`*.railway.internal`, which only resolves inside the project),
+add the **Tailscale Forwarder** template to the same project to bridge your tailnet
+into that private network — no code, nothing exposed publicly:
+
+1. In the Tailscale admin console, create a **reusable** auth key.
+2. Project canvas → Create → Choose Template → **Tailscale Forwarder**.
+3. Configure it:
+   - `TS_AUTHKEY` = the reusable key.
+   - `TS_STATE_DIR=/app/data` **and mount a volume at `/app/data`** (stable node
+     identity; avoids a duplicate machine on every restart).
+   - `CONNECTION_MAPPING_1=https:7100:${{carma.RAILWAY_PRIVATE_DOMAIN}}:${{carma.PORT}}`
+     — the `https:` prefix has the forwarder terminate TLS with a cert for its
+     tailnet machine name (needs MagicDNS + HTTPS enabled on the tailnet); drop it
+     for plain TCP (still WireGuard-encrypted over the tailnet).
+4. Join your laptop / agent host to the same tailnet, then point the MCP client at
+   `https://<forwarder-machine-name>:7100/mcp` (e.g.
+   `carma-project-production-tailscale-forwarder`) with the bearer token.
+
+Note `railway connect --tunnel-only` is **database-only**, so it can't tunnel the
+MCP port; use the forwarder (durable) or, for a quick one-off, a native
+`ssh -N -L 7100:localhost:<CARMA_PORT> <copied-target>@ssh.railway.com` forward and
+point the client at `http://localhost:7100/mcp`.
+
+**Self-hosted Docker — Tailscale sidecar.** For a Docker host you control, run a
+Tailscale sidecar next to CARMA so CARMA is served *on the tailnet* and binds no host
+port. See [`../docker-compose.tailscale.yml`](../docker-compose.tailscale.yml): a
+`tailscale` service joins the tailnet and `carma` shares its network namespace, so
+tailnet members reach `http://carma:7100/mcp` and nobody else can. (This uses a
+kernel `tun` device; on hosts that forbid one, use a userspace forwarder like the
+Railway template above instead.)
+
+**Cloudflare Tunnel + Access** is the equivalent recipe when you want an
+identity-gated public hostname rather than an overlay: `cloudflared` dials out from
+beside CARMA, and Access authenticates each caller (SSO / service token) at the edge.
+
 ### If a public endpoint is unavoidable
 
 Put an mTLS-terminating proxy or authenticating gateway in front (verify a client
