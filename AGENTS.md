@@ -96,9 +96,13 @@ Production/hardening:
 - `DREAM_SIM_THRESHOLD` (`0.92`) / `DREAM_MIN_CLUSTER_SIZE` (`3`) — batch near-duplicate similarity
   for the dedup pass, and minimum decisions on one task before it is abstracted into a semantic memory.
 - `DREAM_MAX_REVIEWS` (`100`) / `DREAM_MAX_ABSTRACTIONS` (`50`) — per-run caps so a dream pass is bounded.
-- `MEMORY_MODEL_PROVIDER` (`local` default | `fireworks`) / `MEMORY_MODEL_NAME` — the pluggable model
-  used for consolidation reasoning (near-duplicate proposals + episodic→semantic gisting). `local` is
-  deterministic and offline; `fireworks` uses an OpenAI-compatible chat endpoint and falls back to
+- `MEMORY_MODEL_PROVIDER` (`local` default | `fireworks` | `openai`) / `MEMORY_MODEL_NAME` — the
+  pluggable model used for consolidation reasoning (near-duplicate proposals + episodic→semantic
+  gisting). `local` is deterministic and offline; `fireworks` uses the Fireworks chat API; `openai`
+  targets any OpenAI-compatible `/v1/chat/completions` endpoint — a self-hosted **vLLM** or **Ollama**
+  — via `MEMORY_MODEL_BASE_URL` (or the shared `INFERENCE_BASE_URL`, e.g. `http://vllm:8000/v1`) and an
+  optional `MEMORY_MODEL_API_KEY`/`OPENAI_API_KEY` (keyless self-hosted servers work). Any provider
+  falls back to
   local on any error. Provider-neutral — bring any backend.
 Native ingestion (sources CARMA pulls itself):
 - `SOURCES` (inline JSON array) or `SOURCES_FILE` (path to that JSON) — source definitions, one per
@@ -126,6 +130,11 @@ Native ingestion (sources CARMA pulls itself):
   are missing (recommended in production).
 - `MCP_HTTP_ENABLED` (default `true`) / `MCP_HTTP_PATH` (default `/mcp`) — expose the MCP
   Streamable HTTP transport on the main server so remote agent harnesses can connect.
+- `STATUS_PUBLIC` (default `false`) — when false, unauthenticated `GET /api/status` returns only
+  coarse readiness booleans; the full detail (trust domain, configured sources incl. repo slugs,
+  ingest state) requires a read capability. Set `true` to expose the full detail anonymously (local/dev).
+- `UI_ENABLED` (default `true`) — serve the built-in config UI at `/` and `/ui`; disable in hardened
+  deployments. See `docs/EXPOSURE.md` for the no-public-listener (Zero-Trust tunnel) topology.
 - `WAKE_RECENT` (`5`) / `WAKE_IDENTITY` (`8`) / `WAKE_RELEVANT` (`5`) — layer sizes for the
   session-start "wake" brief (`POST /wake`, MCP `wake` tool, `memory://<domain>/wake` resource):
   how many recent decisions, identity/self memories, and (when a task is given) relevant precedents.
@@ -146,8 +155,11 @@ Native ingestion (sources CARMA pulls itself):
 ## Endpoints
 
 - `GET /` (and `/ui`) — built-in, self-contained configuration/readiness UI (no external assets).
+  Disabled when `UI_ENABLED=false` (then `404`).
 - `GET /api/status` — JSON deploy diagnostics: `PUBLIC_KEY`/`PRIVATE_KEY`, DB connectivity,
   `agent_memory` schema, RAG (pgvector), and audit-log readiness. Booleans only — never secrets.
+  Without `STATUS_PUBLIC=true`, anonymous callers get only coarse readiness (`ready` + component
+  booleans); full detail (trust domain, sources, ingest state) requires a read capability.
 - `GET /health` — liveness (always `200` while the process is up).
 - `GET /ready` — readiness (`200` only when it can serve: key valid + DB connected + schema);
   `503` otherwise. Use this for orchestrator readiness probes.

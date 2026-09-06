@@ -96,7 +96,9 @@ tracker/internal APIs, and start the ingest → consolidate → distill → reca
 the provider-neutral runbook in [`docs/GO_LIVE.md`](docs/GO_LIVE.md) (host-specific notes for
 Railway are in [`docs/DEPLOY_RAILWAY.md`](docs/DEPLOY_RAILWAY.md)). Copy
 [`docs/examples/sources.example.json`](docs/examples/sources.example.json) as your sources
-template.
+template. For network posture — running CARMA with no public listener behind a Zero-Trust
+tunnel, the `/api/status` hardening, and self-hosted model (vLLM/Ollama) options — see
+[`docs/EXPOSURE.md`](docs/EXPOSURE.md).
 
 ## Endpoints
 - `GET /` — configuration/readiness UI · `GET /api/status` — deploy diagnostics

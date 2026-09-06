@@ -126,7 +126,10 @@ curl <APP_URL>/ready      # -> 200 when keys + DB + schema are ready
 ```
 
 `GET <APP_URL>/api/status` reports readiness booleans and `ingest.sources[]` with each
-source's last run. The built-in config UI at `/` shows the same diagnostics.
+source's last run. The built-in config UI at `/` shows the same diagnostics. Note: by default the
+full `/api/status` detail requires a read token (anonymous callers get only coarse readiness); set
+`STATUS_PUBLIC=true` for anonymous detail, or `UI_ENABLED=false` to disable the UI. See
+[`EXPOSURE.md`](EXPOSURE.md) for the recommended no-public-listener (Zero-Trust tunnel) topology.
 
 ## 6. Verify end-to-end (smoke test)
 
@@ -191,3 +194,9 @@ Put CARMA on private networking. The connectors make **outbound** calls to your
 repo/DB/tracker/APIs, so nothing about CARMA needs public exposure. Read-only source
 credentials + a private CARMA endpoint mean the only thing leaving your perimeter is
 what you explicitly point a connector at.
+
+For external agent sessions that live outside your network, reach CARMA over a
+Zero-Trust tunnel (Cloudflare Tunnel+Access or Tailscale) rather than a public port,
+and lock down the anonymous surface (`STATUS_PUBLIC` unset, optionally
+`UI_ENABLED=false`). The full topology, token-provisioning patterns for MCP
+harnesses, and self-hosted model (vLLM/Ollama) options are in [`EXPOSURE.md`](EXPOSURE.md).
