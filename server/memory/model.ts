@@ -115,27 +115,39 @@ export class LocalMemoryModel implements MemoryModel {
   }
 }
 
-// OpenAI-compatible chat model (Fireworks by default). Used only when explicitly
-// configured; any failure falls back to the local model so dreaming never breaks.
+// OpenAI-compatible chat model. Used only when explicitly configured; any
+// failure falls back to the local model so dreaming never breaks. Works with
+// Fireworks (default path shape) or any OpenAI-compatible server — a self-hosted
+// vLLM or Ollama — by supplying `baseUrl` + `chatPath`. The API key is optional
+// so keyless self-hosted endpoints (e.g. Ollama) work.
 export class ChatMemoryModel implements MemoryModel {
   name: string;
   private fallback = new LocalMemoryModel();
   private apiKey: string;
   private model: string;
   private baseUrl: string;
-  constructor(opts: { apiKey: string; model: string; baseUrl?: string; name?: string }) {
-    this.apiKey = opts.apiKey;
+  private chatPath: string;
+  private requireKey: boolean;
+  constructor(opts: { apiKey?: string; model: string; baseUrl?: string; name?: string; chatPath?: string; requireKey?: boolean }) {
+    this.apiKey = opts.apiKey || '';
     this.model = opts.model;
     this.baseUrl = (opts.baseUrl || 'https://api.fireworks.ai').replace(/\/$/, '');
+    // Fireworks serves chat at /inference/v1/...; standard OpenAI servers (vLLM,
+    // Ollama) use /v1/chat/completions.
+    this.chatPath = opts.chatPath || '/inference/v1/chat/completions';
+    // Fireworks needs a key; self-hosted OpenAI-compatible servers may not.
+    this.requireKey = opts.requireKey ?? true;
     this.name = opts.name || 'fireworks';
   }
 
   private async chatJson(system: string, user: string): Promise<any | null> {
-    if (!this.apiKey) return null;
+    if (this.requireKey && !this.apiKey) return null;
     try {
-      const res = await fetch(`${this.baseUrl}/inference/v1/chat/completions`, {
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if (this.apiKey) headers.authorization = `Bearer ${this.apiKey}`;
+      const res = await fetch(`${this.baseUrl}${this.chatPath}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey}` },
+        headers,
         body: JSON.stringify({
           model: this.model,
           temperature: 0,
@@ -190,7 +202,19 @@ export function getMemoryModel(config: any): MemoryModel {
       apiKey: config.fireworksApiKey,
       model: config.memoryModelName,
       baseUrl: config.fireworksBaseUrl,
+      chatPath: '/inference/v1/chat/completions',
       name: 'fireworks',
+    });
+  }
+  // Any OpenAI-compatible endpoint (self-hosted vLLM/Ollama, or a hosted API).
+  if (config?.memoryModelProvider === 'openai' && config?.memoryModelBaseUrl) {
+    return new ChatMemoryModel({
+      apiKey: config.memoryModelApiKey,
+      model: config.memoryModelName,
+      baseUrl: config.memoryModelBaseUrl,
+      chatPath: '/v1/chat/completions',
+      requireKey: false,
+      name: 'openai',
     });
   }
   return new LocalMemoryModel();

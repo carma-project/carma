@@ -23,6 +23,34 @@ test('parseConfig: defaults, warnings, and SSL mapping', () => {
   assert.equal(strict.rateLimitRps, 5);
 });
 
+test('parseConfig: exposure hardening defaults + toggles', () => {
+  const c = parseConfig({});
+  // Secure by default: full /api/status detail is gated; UI still served.
+  assert.equal(c.statusPublic, false);
+  assert.equal(c.uiEnabled, true);
+
+  const open = parseConfig({ STATUS_PUBLIC: 'true', UI_ENABLED: 'false' });
+  assert.equal(open.statusPublic, true);
+  assert.equal(open.uiEnabled, false);
+});
+
+test('parseConfig: openai memory-model provider validation', () => {
+  // openai without a base URL warns and is usable only as a fallback.
+  const noUrl = parseConfig({ MEMORY_MODEL_PROVIDER: 'openai' });
+  assert.equal(noUrl.memoryModelProvider, 'openai');
+  assert.ok(noUrl.warnings.some((w) => w.includes('MEMORY_MODEL_BASE_URL')));
+
+  // INFERENCE_BASE_URL is accepted as the shared knob; key optional.
+  const vllm = parseConfig({ MEMORY_MODEL_PROVIDER: 'openai', INFERENCE_BASE_URL: 'http://vllm:8000/v1' });
+  assert.equal(vllm.memoryModelBaseUrl, 'http://vllm:8000/v1');
+  assert.ok(!vllm.warnings.some((w) => w.includes('MEMORY_MODEL_BASE_URL')));
+
+  // Unknown provider falls back to local with a warning.
+  const bogus = parseConfig({ MEMORY_MODEL_PROVIDER: 'nope' });
+  assert.equal(bogus.memoryModelProvider, 'local');
+  assert.ok(bogus.warnings.some((w) => w.includes('MEMORY_MODEL_PROVIDER')));
+});
+
 test('RateLimiter: burst then throttle, refills over time', () => {
   let t = 0;
   const rl = new RateLimiter({ rps: 10, burst: 3, now: () => t });

@@ -374,8 +374,8 @@ const requestHandler = async (req, res) => {
       return handleMcp(req, res, requestId);
     }
 
-    // Built-in configuration UI.
-    if (path === '/' || path === '/ui') {
+    // Built-in configuration UI (optional; disable in hardened deployments).
+    if ((path === '/' || path === '/ui') && config.uiEnabled) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(UI_HTML);
     }
@@ -432,7 +432,31 @@ const requestHandler = async (req, res) => {
         status.database.schemaReady &&
         status.rag.ready &&
         status.audit.ready;
-      return sendJson(res, 200, status);
+
+      // The full status is useful recon (trust domain, source repo slugs, ingest
+      // state). Unless STATUS_PUBLIC is set, only a caller holding a read
+      // capability sees the detail; anonymous callers get coarse readiness
+      // booleans — enough for an uptime probe, nothing to enumerate.
+      let authed = false;
+      if (!config.statusPublic) {
+        try {
+          await authorize(req, `memory://${config.trustDomain || 'status'}/status`, 'read');
+          authed = true;
+        } catch {
+          authed = false;
+        }
+      }
+      if (config.statusPublic || authed) return sendJson(res, 200, status);
+      return sendJson(res, 200, {
+        ready: status.ready,
+        components: {
+          publicKey: status.publicKey.valid,
+          database: status.database.connected,
+          schema: status.database.schemaReady,
+          rag: status.rag.ready,
+          audit: status.audit.ready,
+        },
+      });
     }
 
     // ----- mTLS-gated capability issuance / refresh -----

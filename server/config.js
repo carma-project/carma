@@ -141,8 +141,17 @@ export function parseConfig(env = {}) {
     // Pluggable memory model for consolidation reasoning (proposals + gisting).
     // 'local' is deterministic and offline (default); 'fireworks' uses an
     // OpenAI-compatible chat endpoint. Provider-neutral: bring any model backend.
+    // 'local' (offline/deterministic), 'fireworks' (Fireworks chat API), or
+    // 'openai' (any OpenAI-compatible /v1/chat/completions endpoint — e.g. a
+    // self-hosted vLLM or Ollama server). Provider-neutral: bring any backend.
     memoryModelProvider: (env.MEMORY_MODEL_PROVIDER || 'local').toLowerCase(),
     memoryModelName: env.MEMORY_MODEL_NAME || 'accounts/fireworks/models/llama-v3p1-8b-instruct',
+    // Generic inference endpoint for the 'openai' provider. INFERENCE_BASE_URL is
+    // the shared knob (also usable by other OpenAI-compatible integrations); e.g.
+    // http://vllm:8000/v1 or http://ollama:11434/v1. API key optional (self-hosted
+    // servers like Ollama accept none).
+    memoryModelBaseUrl: env.MEMORY_MODEL_BASE_URL || env.INFERENCE_BASE_URL || '',
+    memoryModelApiKey: env.MEMORY_MODEL_API_KEY || env.OPENAI_API_KEY || '',
     // Distillation / fine-tuning
     finetuneProvider: (env.FINETUNE_PROVIDER || 'local').toLowerCase(),
     fireworksApiKey: env.FIREWORKS_API_KEY || '',
@@ -157,6 +166,16 @@ export function parseConfig(env = {}) {
     // available for local harnesses via `npm run mcp`.
     mcpHttpEnabled: toBool(env.MCP_HTTP_ENABLED, true),
     mcpHttpPath: env.MCP_HTTP_PATH || '/mcp',
+    // Exposure hardening. `/api/status` reveals operational detail (trust domain,
+    // configured sources incl. repo slugs, ingest state) that is useful recon for
+    // an anonymous caller. By default the full detail requires a read capability;
+    // unauthenticated callers get only coarse readiness booleans (enough for an
+    // uptime probe). Set STATUS_PUBLIC=true to expose the full detail anonymously
+    // (handy for local/dev). `/health` and `/ready` are always open.
+    statusPublic: toBool(env.STATUS_PUBLIC, false),
+    // Serve the built-in configuration UI at `/` and `/ui`. Disable in hardened
+    // deployments where even the fingerprint/landing page should not be served.
+    uiEnabled: toBool(env.UI_ENABLED, true),
     // Wake (session-start priming): the recall counterpart to ingest/dream.
     // Layer sizes for the brief composed at the start of a session (POST /wake,
     // MCP `wake` tool, and the memory://<domain>/wake resource).
@@ -234,12 +253,15 @@ export function parseConfig(env = {}) {
   } else if (!['local', 'fireworks'].includes(cfg.finetuneProvider)) {
     cfg.warnings.push(`FINETUNE_PROVIDER="${cfg.finetuneProvider}" unknown; supported: local, fireworks.`);
   }
-  if (!['local', 'fireworks'].includes(cfg.memoryModelProvider)) {
-    cfg.warnings.push(`MEMORY_MODEL_PROVIDER="${cfg.memoryModelProvider}" unknown; supported: local, fireworks. Falling back to local.`);
+  if (!['local', 'fireworks', 'openai'].includes(cfg.memoryModelProvider)) {
+    cfg.warnings.push(`MEMORY_MODEL_PROVIDER="${cfg.memoryModelProvider}" unknown; supported: local, fireworks, openai. Falling back to local.`);
     cfg.memoryModelProvider = 'local';
   }
   if (cfg.memoryModelProvider === 'fireworks' && !cfg.fireworksApiKey) {
     cfg.warnings.push('MEMORY_MODEL_PROVIDER=fireworks but FIREWORKS_API_KEY is not set — dream will fall back to local reasoning.');
+  }
+  if (cfg.memoryModelProvider === 'openai' && !cfg.memoryModelBaseUrl) {
+    cfg.warnings.push('MEMORY_MODEL_PROVIDER=openai but MEMORY_MODEL_BASE_URL/INFERENCE_BASE_URL is not set — dream will fall back to local reasoning.');
   }
   if (cfg.capabilityEndpointEnabled) {
     if (!['direct', 'proxy'].includes(cfg.mtlsMode)) {
@@ -311,6 +333,8 @@ export function redactedSummary(cfg) {
     embedDim: cfg.embedDim,
     finetuneProvider: cfg.finetuneProvider,
     mcpHttp: cfg.mcpHttpEnabled ? cfg.mcpHttpPath : false,
+    exposure: { statusPublic: cfg.statusPublic, ui: cfg.uiEnabled },
+    memoryModel: cfg.memoryModelProvider,
     wake: { recent: cfg.wakeRecent, identity: cfg.wakeIdentity, relevant: cfg.wakeRelevant, mcpInstructions: cfg.mcpWakeInstructions },
     capability: cfg.capabilityEndpointEnabled
       ? { mode: cfg.mtlsMode, tls: cfg.mtlsDirectTls ? 'direct' : 'proxy-or-none', domains: cfg.capabilityDomains, maxActions: cfg.capabilityMaxActions, maxTtlSeconds: cfg.capabilityMaxTtlSeconds, fingerprintPinned: cfg.capabilityTrustedFingerprints.length > 0 }
