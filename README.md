@@ -89,6 +89,17 @@ FINETUNE_PROVIDER=fireworks FIREWORKS_API_KEY=... FIREWORKS_ACCOUNT_ID=... \
 
 See [`docs/DISTILLATION.md`](docs/DISTILLATION.md).
 
+## Deploy for your organization
+
+To stand CARMA up for your own org — deploy privately, connect your repo/database/issue
+tracker/internal APIs, and start the ingest → consolidate → distill → recall loop — follow
+the provider-neutral runbook in [`docs/GO_LIVE.md`](docs/GO_LIVE.md) (host-specific notes for
+Railway are in [`docs/DEPLOY_RAILWAY.md`](docs/DEPLOY_RAILWAY.md)). Copy
+[`docs/examples/sources.example.json`](docs/examples/sources.example.json) as your sources
+template. For network posture — running CARMA with no public listener behind a Zero-Trust
+tunnel, the `/api/status` hardening, and self-hosted model (vLLM/Ollama) options — see
+[`docs/EXPOSURE.md`](docs/EXPOSURE.md).
+
 ## Endpoints
 - `GET /` — configuration/readiness UI · `GET /api/status` — deploy diagnostics
 - `GET /health` — liveness · `GET /ready` — readiness

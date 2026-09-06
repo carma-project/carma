@@ -1,0 +1,49 @@
+[
+  {
+    "id": "company-repo",
+    "type": "git",
+    "url": "https://github.com/your-org/your-repo.git",
+    "repo": "your-org/your-repo",
+    "branch": "main",
+    "tokenEnv": "SRC_GITHUB_TOKEN",
+    "docs": true,
+    "history": true,
+    "intervalMinutes": 60,
+    "_comment": "Agent specs (.cursor/, AGENTS.md), ADRs/decisions, company-OS docs, AND full commit history (every change + its reasoning; a revert becomes a failure signal). Set docs/history to false to skip either. tokenEnv is only needed for private repos."
+  },
+  {
+    "id": "company-db",
+    "type": "postgres",
+    "dsnEnv": "SRC_DB_DSN",
+    "ssl": true,
+    "query": "SELECT id, title, body AS content, created_at, decision FROM your_table WHERE created_at > now() - interval '365 days' ORDER BY created_at",
+    "columns": { "id": "id", "title": "title", "content": "content", "date": "created_at", "decision": "decision" },
+    "confidence": 0.8,
+    "importance": 0.8,
+    "intervalMinutes": 180,
+    "_comment": "Any table where a row carries a decision/outcome + its rationale. Map your column names in `columns`. Use a READ-ONLY DB role and reference it via dsnEnv (never inline the DSN). Drop this source if you have no such table."
+  },
+  {
+    "id": "company-tracker",
+    "type": "github",
+    "repo": "your-org/your-repo",
+    "tokenEnv": "SRC_GITHUB_TOKEN",
+    "state": "all",
+    "includeComments": true,
+    "maxPages": 10,
+    "intervalMinutes": 120,
+    "_comment": "Issues + PRs (titles, descriptions, review threads) — where decision discussion lives. Merged PR -> success, closed 'not planned' -> failure, feeding outcome-weighted recall. Remove if you don't use GitHub issues/PRs."
+  },
+  {
+    "id": "company-kb",
+    "type": "http",
+    "url": "https://kb.internal.example/api/docs",
+    "tokenEnv": "SRC_HTTP_TOKEN",
+    "itemsPath": "data",
+    "fields": { "id": "slug", "title": "name", "content": "markdown", "date": "updated_at" },
+    "confidence": 0.85,
+    "importance": 0.8,
+    "intervalMinutes": 240,
+    "_comment": "Optional: any internal JSON API (runbooks, wiki export, knowledge base). `itemsPath` locates the array in the response; `fields` maps record keys. Remove if not applicable."
+  }
+]
