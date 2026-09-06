@@ -179,6 +179,9 @@ Recall is provider-neutral — any harness reaches CARMA the same way:
 - **HTTP.** `GET <APP_URL>/search?q=…&k=5&domain=acme` returns the same ranked
   precedents, each carrying the reasoning, decision, outcome, and lineage.
 
+For Claude Desktop and Cursor specifically (exact MCP config, token, and the
+wake-on-start / capture-on-end workflow), see [`CONNECT_AGENTS.md`](CONNECT_AGENTS.md).
+
 ## 9. Scoped tokens without sharing the signing key (optional)
 
 By default tokens are minted out-of-band with `npm run mint-token`. To let services
