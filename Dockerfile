@@ -8,6 +8,9 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 COPY . .
 EXPOSE 7100
+# Drop root: the app tree is read-only for the service and INGEST_WORK_DIR
+# defaults to /tmp, which the node user can write.
+USER node
 # Run migrations (idempotent, advisory-locked) then start. Migrations are skipped
 # if already applied, so this is safe on every boot and across replicas.
 CMD ["sh", "-c", "node adapters/migrate.mjs && node --import tsx server/index.js"]
