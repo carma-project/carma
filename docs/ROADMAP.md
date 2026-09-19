@@ -148,5 +148,8 @@ the container, no external orchestration required:
 ## Phase 3 - Ecosystem
 - [ ] Federation via ANS
 - [ ] Bridge adapters (Markdown, File)
+- [ ] Coordination substrate — CARMA as the shared, governed channel between agents
+      and humans (addressed handoffs, inbox resources with MCP subscriptions, a
+      generalized human review queue). Design note: `docs/adr/0001-coordination-substrate.md`.
 - [~] Web UI — a built-in configuration/readiness UI ships at `/`; a full
       management UI is still open.
