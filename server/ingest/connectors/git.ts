@@ -8,6 +8,10 @@ import { execFileSync } from 'node:child_process';
 import { extractMarkdownItems, extractGitItems, repoSlug } from '../extract.js';
 import type { CollectContext, CollectResult } from './index.js';
 
+// A stalled remote must not hang ingestion (and, since git runs synchronously,
+// the request loop) indefinitely.
+const GIT_TIMEOUT_MS = 10 * 60 * 1000;
+
 function isLocalCheckout(url: string): boolean {
   if (url.startsWith('file://')) return true;
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) return false; // http(s), git, ssh scheme
@@ -23,27 +27,53 @@ function localPath(url: string): string {
   return url.startsWith('file://') ? url.slice('file://'.length) : url;
 }
 
-function git(dir: string, args: string[]) {
-  return execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024 });
+// Strip embedded credentials (https://user:token@host) from text that may reach
+// logs, audit rows, /api/status or an /ingest response.
+export function redactUrlCredentials(text: string): string {
+  return String(text).replace(/(:\/\/)[^/\s@]+@/g, '$1***@');
 }
 
-// Inject a token for private https clones when tokenEnv is set.
-function authUrl(source: any): string {
-  const raw = source.url;
-  if (source.tokenEnv && /^https:\/\//i.test(raw)) {
+// Credentials for private https remotes travel as an http.extraHeader through
+// GIT_CONFIG_* environment variables — never on the command line or in the
+// remote URL — so they cannot surface in error text, process listings, or the
+// checkout's .git/config.
+function gitEnv(source: any): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  if (source.tokenEnv && /^https:\/\//i.test(String(source.url))) {
     const token = process.env[source.tokenEnv];
-    if (token) return raw.replace(/^https:\/\//i, `https://x-access-token:${token}@`);
+    if (token) {
+      const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
+      env.GIT_CONFIG_COUNT = '1';
+      env.GIT_CONFIG_KEY_0 = 'http.extraHeader';
+      env.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${basic}`;
+    }
   }
-  return raw;
+  return env;
 }
 
-function defaultBranch(dir: string): string {
+function git(dir: string | null, args: string[], env: NodeJS.ProcessEnv): string {
+  const argv = dir ? ['-C', dir, ...args] : args;
   try {
-    const ref = git(dir, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']).trim();
+    return execFileSync('git', argv, {
+      encoding: 'utf8',
+      maxBuffer: 512 * 1024 * 1024,
+      timeout: GIT_TIMEOUT_MS,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (e: any) {
+    const detail = (e?.stderr ? String(e.stderr).trim() : '') || e?.message || String(e);
+    throw new Error(`git ${args[0]} failed: ${redactUrlCredentials(detail)}`);
+  }
+}
+
+function defaultBranch(dir: string, env: NodeJS.ProcessEnv): string {
+  try {
+    const ref = git(dir, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], env).trim();
     return ref.replace(/^origin\//, '') || 'main';
   } catch {
     try {
-      return git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']).trim() || 'main';
+      return git(dir, ['rev-parse', '--abbrev-ref', 'HEAD'], env).trim() || 'main';
     } catch {
       return 'main';
     }
@@ -52,30 +82,35 @@ function defaultBranch(dir: string): string {
 
 // Ensure a current local checkout and return its directory. Local sources are
 // used in place; remote git URLs are cloned once then fast-forwarded on later
-// runs. Deterministic per source id.
+// runs. Deterministic per source id, always inside workDir.
 export function ensureCheckout(source: any, workDir: string, log: (e: string, d?: any) => void = () => {}): string {
-  if (isLocalCheckout(source.url)) {
-    const p = path.resolve(localPath(source.url));
+  if (isLocalCheckout(String(source.url))) {
+    const p = path.resolve(localPath(String(source.url)));
     if (!fs.existsSync(p)) throw new Error(`source ${source.id}: local path not found: ${p}`);
     return p;
   }
-  fs.mkdirSync(workDir, { recursive: true });
-  const dest = path.join(workDir, source.id.replace(/[^A-Za-z0-9._-]/g, '_'));
-  const url = authUrl(source);
+  const safeId = String(source.id ?? '').replace(/[^A-Za-z0-9._-]/g, '_');
+  if (!safeId || safeId === '.' || safeId === '..') throw new Error(`source ${source.id}: invalid source id`);
+  const root = path.resolve(workDir);
+  const dest = path.resolve(root, safeId);
+  if (!dest.startsWith(root + path.sep)) throw new Error(`source ${source.id}: checkout would escape INGEST_WORK_DIR`);
+  fs.mkdirSync(root, { recursive: true });
+  const env = gitEnv(source);
+  const url = String(source.url);
   if (fs.existsSync(path.join(dest, '.git'))) {
     log('ingest_checkout_update', { source: source.id });
-    git(dest, ['remote', 'set-url', 'origin', url]);
-    git(dest, ['fetch', '--prune', '--tags', 'origin']);
-    const branch = source.branch || defaultBranch(dest);
-    git(dest, ['checkout', '-q', branch]);
-    git(dest, ['reset', '--hard', `origin/${branch}`]);
+    git(dest, ['remote', 'set-url', 'origin', url], env);
+    git(dest, ['fetch', '--prune', '--tags', 'origin'], env);
+    const branch = source.branch || defaultBranch(dest, env);
+    git(dest, ['checkout', '-q', branch], env);
+    git(dest, ['reset', '--hard', `origin/${branch}`], env);
   } else {
     log('ingest_checkout_clone', { source: source.id });
     fs.rmSync(dest, { recursive: true, force: true });
     const args = ['clone', '--quiet'];
     if (source.branch) args.push('--branch', source.branch);
     args.push(url, dest);
-    execFileSync('git', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    git(null, args, env);
   }
   return dest;
 }

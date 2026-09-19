@@ -74,10 +74,13 @@ function walk(root: string, excludes: string[]): string[] {
   const skipDir = new Set(['.git', 'node_modules', '.next', 'dist', 'build', 'vendor', '.venv']);
   (function rec(d: string) {
     for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
+      // Never follow symlinks: a committed link could point anywhere the
+      // process can read (its environment, keys, the checkout's .git/config).
+      if (ent.isSymbolicLink()) continue;
       const full = path.join(d, ent.name);
       if (ent.isDirectory()) {
         if (!skipDir.has(ent.name)) rec(full);
-      } else if (/\.mdx?$/i.test(ent.name)) {
+      } else if (ent.isFile() && /\.mdx?$/i.test(ent.name)) {
         const rel = path.relative(root, full);
         if (!excludes.some((x) => rel.includes(x))) out.push(rel);
       }

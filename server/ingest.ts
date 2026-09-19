@@ -98,7 +98,9 @@ export async function storeTrace(adapter: any, ctx: IngestContext, input: TraceI
   let occurredAt: string | null = null;
   if (input?.occurredAt) {
     const d = new Date(input.occurredAt);
-    if (!Number.isNaN(d.getTime())) occurredAt = d.toISOString();
+    // Clamp to now: a future event time would otherwise dominate recall's
+    // recency term for every query (git author dates are not trustworthy).
+    if (!Number.isNaN(d.getTime())) occurredAt = (d.getTime() > Date.now() ? new Date() : d).toISOString();
   }
   const issuedAt = occurredAt || now;
   const envelope: any = {
