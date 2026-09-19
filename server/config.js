@@ -81,6 +81,9 @@ export function parseConfig(env = {}) {
     trustDomain: env.TRUST_DOMAIN || '',
     publicKeyPem: env.PUBLIC_KEY || '',
     privateKeyPem: env.PRIVATE_KEY || '',
+    // Optional expected iss / aud on capability tokens; enforced only when set.
+    jwtIssuer: env.JWT_ISSUER || '',
+    jwtAudience: env.JWT_AUDIENCE || '',
     databaseUrl: env.DATABASE_URL || '',
     // 'disable' (default) | 'require' (encrypt, don't verify) | 'verify' (verify CA)
     databaseSsl: (env.DATABASE_SSL || 'disable').toLowerCase(),
@@ -308,8 +311,14 @@ export function parseConfig(env = {}) {
 
   // When true, the HTTP listener is upgraded to HTTPS so CARMA can terminate
   // TLS and verify client certs itself (direct mTLS for POST /capability).
+  // Without an operator CA the listener would fall back to the public root
+  // store and accept any public-CA client cert, so the CA is mandatory.
   cfg.mtlsDirectTls =
-    cfg.capabilityEndpointEnabled && cfg.mtlsMode === 'direct' && Boolean(cfg.tlsCertPem) && Boolean(cfg.tlsKeyPem);
+    cfg.capabilityEndpointEnabled &&
+    cfg.mtlsMode === 'direct' &&
+    Boolean(cfg.tlsCertPem) &&
+    Boolean(cfg.tlsKeyPem) &&
+    Boolean(cfg.capabilityClientCaPem);
 
   // Node pg SSL config, or false to disable.
   cfg.dbSslConfig =

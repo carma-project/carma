@@ -61,7 +61,9 @@ Core:
 - `PORT` — HTTP port (default `7100`).
 - `PUBLIC_KEY` — Ed25519 **SPKI PEM**. Imported at startup via `jose.importSPKI(..., 'EdDSA')`
   to verify capability tokens. If unset/invalid, the process still boots and `/health` works,
-  but authenticated endpoints return `403`.
+  but authenticated endpoints return `401`.
+- `JWT_ISSUER` / `JWT_AUDIENCE` — optional expected `iss` / `aud` on capability tokens; enforced only
+  when set. `issueCapability` (and `npm run mint-token`) stamp the same values from the environment.
 - `PRIVATE_KEY` — Ed25519 **PKCS8 PEM**. Signs stored envelopes on ingest and mints tokens.
 - `DATABASE_URL` — Postgres connection string (needs pgvector). Run `npm run migrate` first.
 - `TRUST_DOMAIN` — default trust domain for ingest/search when not supplied per-request.
@@ -241,8 +243,9 @@ Verify with terminal requests. With the server on `:7100`:
 
 - `curl http://localhost:7100/health` -> `ok` (HTTP 200)
 - `curl http://localhost:7100/api/status` -> JSON; `"ready":true` once fully configured
-- No token -> `403 Forbidden: Missing token`; invalid JWT / wrong domain / missing action -> `403`
-- Disallowed scheme / path traversal in `uri` -> `403` (`server/middleware/guardrails.ts`)
+- No token / invalid or expired JWT -> `401 {"error":"Unauthorized"}`; wrong domain / missing action -> `403 {"error":"Forbidden"}`
+  (the reason is written to the log and audit entry, never echoed to the client)
+- Disallowed scheme / path traversal in `uri` -> `400` (`server/middleware/guardrails.ts`)
 - `POST /memory` with a `write` token -> `201 {uri, stored:true}`; then `GET /search?q=...`
   returns that pointer ranked by similarity; `GET /resolve?uri=...` returns the signed envelope.
 

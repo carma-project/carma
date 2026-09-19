@@ -113,6 +113,24 @@ function sendText(res, code, text, extraHeaders = {}) {
   res.end(text);
 }
 
+// Authentication vs authorization failures, without echoing library or config
+// detail to the client — that goes to the log/audit entry the caller writes.
+function denyAuth(res, e) {
+  if (/not permitted/i.test(e?.message || '')) return sendJson(res, 403, { error: 'Forbidden' });
+  res.setHeader('WWW-Authenticate', 'Bearer');
+  return sendJson(res, 401, { error: 'Unauthorized' });
+}
+
+function bearerToken(req) {
+  const m = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization || '');
+  return m ? m[1] : '';
+}
+
+const jwtVerifyOptions = {
+  ...(config.jwtIssuer ? { issuer: config.jwtIssuer } : {}),
+  ...(config.jwtAudience ? { audience: config.jwtAudience } : {}),
+};
+
 function clientKey(req) {
   const xff = req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff.length) return xff.split(',')[0].trim();
@@ -146,11 +164,10 @@ function readJsonBody(req, limitBytes) {
 
 // Verify the bearer token, enforce capability + lifetime for (uri, action).
 async function authorize(req, uri, action) {
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.replace('Bearer ', '');
+  const token = bearerToken(req);
   if (!token) throw new Error('Missing token');
   if (!publicKey) throw new Error('Server missing PUBLIC_KEY');
-  const claims = await verifyCapability(token, publicKey);
+  const claims = await verifyCapability(token, publicKey, jwtVerifyOptions);
   enforceTokenLifetime(claims, action, {
     read: config.tokenMaxAgeRead,
     write: config.tokenMaxAgeWrite,
@@ -183,26 +200,39 @@ function rateLimited(req, res, requestId) {
 const mcpSessions = new Map(); // sessionId -> StreamableHTTPServerTransport
 
 async function authorizeMcp(req) {
-  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  const token = bearerToken(req);
   if (!token) throw new Error('Missing token');
   if (!publicKey) throw new Error('Server missing PUBLIC_KEY');
   if (!config.trustDomain) throw new Error('Server missing TRUST_DOMAIN');
-  const claims = await verifyCapability(token, publicKey);
-  enforceTokenLifetime(claims, 'read', {
+  const claims = await verifyCapability(token, publicKey, jwtVerifyOptions);
+  const actions = (claims.jsonam && claims.jsonam.actions) || [];
+  // A session that can write is held to the write age ceiling for its whole life.
+  const ceiling = actions.includes('write') ? config.tokenMaxAgeWrite : config.tokenMaxAgeRead;
+  enforceTokenLifetime(claims, actions.includes('write') ? 'write' : 'read', {
     read: config.tokenMaxAgeRead,
     write: config.tokenMaxAgeWrite,
   });
   // A session requires at least read on this trust domain; store_trace is
   // additionally gated on 'write' inside the MCP server via allowedActions.
   enforceCapability(claims, `memory://${config.trustDomain}/mcp`, 'read');
-  const actions = (claims.jsonam && claims.jsonam.actions) || [];
-  return { sub: claims.sub, actions };
+  // The session never outlives the token: neither its exp nor its age ceiling.
+  const expiresAt = Math.min(claims.exp * 1000, (claims.iat + ceiling) * 1000);
+  return { sub: claims.sub, actions, expiresAt };
 }
 
 async function handleMcp(req, res, requestId) {
   const sessionId = req.headers['mcp-session-id'];
   const existing = typeof sessionId === 'string' ? mcpSessions.get(sessionId) : undefined;
-  if (existing) return existing.handleRequest(req, res);
+  if (existing) {
+    if (Date.now() > existing.expiresAt) {
+      mcpSessions.delete(sessionId);
+      audit.record({ action: 'mcp_session', result: 'deny', requestId, detail: { reason: 'session expired', sessionId } });
+      Promise.resolve(existing.transport.close()).catch(() => {});
+      res.setHeader('WWW-Authenticate', 'Bearer');
+      return sendJson(res, 401, { error: 'Unauthorized' });
+    }
+    return existing.transport.handleRequest(req, res);
+  }
 
   // No session yet — only an initialize POST may open one, and it must be
   // authenticated. GET/DELETE without a valid session id are rejected.
@@ -216,13 +246,13 @@ async function handleMcp(req, res, requestId) {
   } catch (e) {
     audit.record({ action: 'mcp_connect', result: 'deny', requestId, detail: { reason: e.message } });
     res.setHeader('WWW-Authenticate', 'Bearer');
-    return sendJson(res, 401, { error: 'Unauthorized: ' + e.message });
+    return sendJson(res, 401, { error: 'Unauthorized' });
   }
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
     onsessioninitialized: (sid) => {
-      mcpSessions.set(sid, transport);
+      mcpSessions.set(sid, { transport, expiresAt: grant.expiresAt });
       logger.info('mcp_session_open', { requestId, sessionId: sid, actor: grant.sub });
       audit.record({ actor: grant.sub, action: 'mcp_connect', result: 'allow', requestId, detail: { sessionId: sid, actions: grant.actions } });
     },
@@ -305,6 +335,7 @@ function validateTraceInput(body) {
     if (typeof body.occurredAt !== 'string' || Number.isNaN(Date.parse(body.occurredAt))) {
       throw new Error('occurredAt must be an ISO 8601 date string');
     }
+    if (Date.parse(body.occurredAt) > Date.now() + 5 * 60 * 1000) throw new Error('occurredAt cannot be in the future');
     occurredAt = new Date(body.occurredAt).toISOString();
   }
 
@@ -492,7 +523,7 @@ const requestHandler = async (req, res) => {
       const presented = (req.headers.authorization || '').replace('Bearer ', '');
       if (presented && publicKey) {
         try {
-          const claims = await verifyCapability(presented, publicKey);
+          const claims = await verifyCapability(presented, publicKey, jwtVerifyOptions);
           priorGrant = { domains: claims.jsonam?.domains || [], actions: claims.jsonam?.actions || [] };
         } catch {
           /* ignore — issuance is gated by mTLS, not the old token */
@@ -548,7 +579,7 @@ const requestHandler = async (req, res) => {
         claims = await authorize(req, uri, 'read');
       } catch (e) {
         audit.record({ action: 'read', uri: parsed.query.uri, result: 'deny', requestId, detail: { reason: e.message } });
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
       }
       try {
         const envelope = await adapter.resolve(uri);
@@ -569,9 +600,6 @@ const requestHandler = async (req, res) => {
       } catch (e) {
         return sendJson(res, 400, { error: e.message });
       }
-      const trustDomain = body.trustDomain || config.trustDomain;
-      if (!trustDomain) return sendJson(res, 400, { error: 'trustDomain not set (body.trustDomain or TRUST_DOMAIN)' });
-
       let input;
       try {
         input = validateTraceInput(body);
@@ -579,13 +607,29 @@ const requestHandler = async (req, res) => {
         return sendJson(res, 400, { error: e.message });
       }
 
-      const uri = body.uri ? sanitizeUri(body.uri) : newTraceUri(trustDomain);
+      // A write lands in the trust domain of the URI being written — exactly what
+      // the capability check below authorizes. body.trustDomain may only restate
+      // that domain, never redirect the write (or a supersede) elsewhere.
+      let uri;
+      try {
+        uri = body.uri ? sanitizeUri(body.uri) : newTraceUri(body.trustDomain || config.trustDomain);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message });
+      }
+      const trustDomain = domainOf(uri);
+      if (!trustDomain) return sendJson(res, 400, { error: 'trustDomain not set (body.trustDomain or TRUST_DOMAIN)' });
+      if (body.trustDomain && body.trustDomain !== trustDomain) {
+        return sendJson(res, 400, { error: 'trustDomain does not match the trust domain of uri' });
+      }
+      if (input.supersedes && domainOf(input.supersedes) !== trustDomain) {
+        return sendJson(res, 400, { error: 'supersedes must reference a memory in the same trust domain' });
+      }
       let claims;
       try {
         claims = await authorize(req, uri, 'write');
       } catch (e) {
         audit.record({ action: 'write', uri, trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
       }
       try {
         const result = await storeTrace(
@@ -614,7 +658,7 @@ const requestHandler = async (req, res) => {
         claims = await authorize(req, `memory://${domain}/search`, 'read');
       } catch (e) {
         audit.record({ action: 'search', trustDomain: domain, result: 'deny', requestId, detail: { reason: e.message } });
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
       }
       try {
         const embedding = toVectorLiteral(await embed(String(q)));
@@ -651,7 +695,7 @@ const requestHandler = async (req, res) => {
         claims = await authorize(req, `memory://${domain}/wake`, 'read');
       } catch (e) {
         audit.record({ action: 'wake', trustDomain: domain, result: 'deny', requestId, detail: { reason: e.message } });
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
       }
       try {
         const wakeDefaults = wakeDefaultsFromConfig(config);
@@ -696,7 +740,7 @@ const requestHandler = async (req, res) => {
         claims = await authorize(req, decisionUri, 'write');
       } catch (e) {
         audit.record({ action: 'outcome', uri: decisionUri, trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
       }
       try {
         const result = await recordOutcome(
@@ -734,7 +778,7 @@ const requestHandler = async (req, res) => {
         claims = await authorize(req, uri, 'write');
       } catch (e) {
         audit.record({ action: 'retract', uri, trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
       }
       try {
         const result = await retractMemory(adapter, { trustDomain }, uri);
@@ -769,11 +813,12 @@ const requestHandler = async (req, res) => {
         claims = await authorize(req, uri, 'write');
       } catch (e) {
         audit.record({ action: 'pin', uri, trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
       }
       try {
         const row = await adapter.resolve(uri);
         if (!row) return sendJson(res, 404, { error: 'Not found', id: uri });
+        if (row.trust_domain && row.trust_domain !== trustDomain) return sendJson(res, 403, { error: 'Forbidden' });
         await adapter.setTier(uri, pinned ? 'pinned' : 'consolidated');
         audit.record({ actor: claims.sub, action: 'pin', uri, trustDomain, result: 'allow', requestId, detail: { pinned } });
         return sendJson(res, 200, { uri, tier: pinned ? 'pinned' : 'consolidated' });
@@ -791,7 +836,7 @@ const requestHandler = async (req, res) => {
       try {
         await authorize(req, `memory://${domain}/review`, 'read');
       } catch (e) {
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
       }
       try {
         const reviews = await adapter.listReviews({ trustDomain: domain || null, status: String(statusFilter) });
@@ -828,7 +873,7 @@ const requestHandler = async (req, res) => {
         claims = await authorize(req, `memory://${trustDomain}/review`, 'write');
       } catch (e) {
         audit.record({ action: 'review_resolve', trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
       }
       try {
         const result = await adapter.resolveReview(body.reviewId, resolution, {
@@ -859,7 +904,7 @@ const requestHandler = async (req, res) => {
         claims = await authorize(req, `memory://${trustDomain}/dataset`, 'distill');
       } catch (e) {
         audit.record({ action: 'distill', trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
       }
       try {
         const result = await runDistillation(adapter, config, {
@@ -890,7 +935,7 @@ const requestHandler = async (req, res) => {
       try {
         await authorize(req, `memory://${domain}/dataset`, 'read');
       } catch (e) {
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
       }
       try {
         const status = await fineTuneStatus(config, String(jobId));
@@ -920,7 +965,7 @@ const requestHandler = async (req, res) => {
         claims = await authorize(req, `memory://${trustDomain}/consolidate`, 'write');
       } catch (e) {
         audit.record({ action: 'consolidate', trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
       }
       try {
         const report = await runDream(adapter, memoryModel, config, {
@@ -960,14 +1005,21 @@ const requestHandler = async (req, res) => {
       } catch (e) {
         return sendJson(res, 400, { error: e.message });
       }
-      const trustDomain = body.trustDomain || config.trustDomain;
-      if (!trustDomain) return sendJson(res, 400, { error: 'trustDomain not set (body.trustDomain or TRUST_DOMAIN)' });
+      // Authorize against the domains the configured sources write into
+      // (source.trustDomain, else TRUST_DOMAIN) — never a caller-supplied one.
+      const targetDomains = [...new Set(config.sources.map((s) => s.trustDomain || config.trustDomain).filter(Boolean))];
+      if (!targetDomains.length && config.trustDomain) targetDomains.push(config.trustDomain);
+      if (!targetDomains.length) return sendJson(res, 400, { error: 'trustDomain not set (source.trustDomain or TRUST_DOMAIN)' });
+      const trustDomain = targetDomains.join(',');
       let claims;
       try {
-        claims = await authorize(req, `memory://${trustDomain}/ingest`, 'write');
+        for (const dom of targetDomains) claims = await authorize(req, `memory://${dom}/ingest`, 'write');
       } catch (e) {
         audit.record({ action: 'ingest', trustDomain, result: 'deny', requestId, detail: { reason: e.message } });
-        return sendText(res, 403, 'Forbidden: ' + e.message);
+        return denyAuth(res, e);
+      }
+      if (body.trustDomain && !targetDomains.includes(body.trustDomain)) {
+        return sendJson(res, 400, { error: 'trustDomain does not match the configured sources' });
       }
 
       if (!config.sources.length) return sendJson(res, 400, { error: 'No sources configured (set SOURCES or SOURCES_FILE)' });

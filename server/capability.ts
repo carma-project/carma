@@ -6,15 +6,20 @@ export interface CapabilityGrant {
   resources?: string[];
   subject?: string;
   ttl?: string;
+  // Default to JWT_ISSUER / JWT_AUDIENCE so minted tokens satisfy a server that
+  // verifies them (server/middleware/jwt.ts); omitted when neither is set.
+  issuer?: string;
+  audience?: string;
 }
 
 // Issue an EdDSA capability token signed with the trust domain private key.
 // This is the minting side of the JWT capability model verified by
-// verifyCapability/enforceCapability. (A full mTLS-gated POST /capability
-// refresh endpoint remains future work per docs/SECURITY.md.)
+// verifyCapability/enforceCapability.
 export async function issueCapability(grant: CapabilityGrant, privateKeyPem: string) {
   const key = await importPKCS8(privateKeyPem, 'EdDSA');
-  return await new SignJWT({
+  const issuer = grant.issuer ?? process.env.JWT_ISSUER;
+  const audience = grant.audience ?? process.env.JWT_AUDIENCE;
+  let jwt = new SignJWT({
     jsonam: {
       domains: grant.domains,
       actions: grant.actions,
@@ -24,6 +29,8 @@ export async function issueCapability(grant: CapabilityGrant, privateKeyPem: str
     .setProtectedHeader({ alg: 'EdDSA', kid: 'carma-key' })
     .setSubject(grant.subject ?? 'carma')
     .setIssuedAt()
-    .setExpirationTime(grant.ttl ?? '1h')
-    .sign(key);
+    .setExpirationTime(grant.ttl ?? '1h');
+  if (issuer) jwt = jwt.setIssuer(issuer);
+  if (audience) jwt = jwt.setAudience(audience);
+  return await jwt.sign(key);
 }

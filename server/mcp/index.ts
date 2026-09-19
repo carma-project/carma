@@ -9,6 +9,12 @@ import { storeTrace, newTraceUri, recordOutcome, retractMemory } from '../ingest
 import { embed, toVectorLiteral } from '../embedding.js';
 import { toPrecedent } from '../recall.js';
 import { composeWake } from '../wake/wake.js';
+import { sanitizeUri } from '../middleware/guardrails.js';
+
+function domainOf(uri: string): string | null {
+  const parts = uri.split('://');
+  return parts.length > 1 ? parts[1].split('/')[0] : null;
+}
 
 export interface MCPConfig {
   trustDomain: string;
@@ -83,11 +89,17 @@ export class CARMAMCPServer {
           contents: [{ uri: req.params.uri, mimeType: 'application/json', text: JSON.stringify(payload) }],
         };
       }
-      const row = await this.adapter.resolve(req.params.uri);
+      // Resource reads are confined to this session's trust domain — the same
+      // rule REST /resolve applies through enforceCapability.
+      const uri = sanitizeUri(req.params.uri);
+      if (domainOf(uri) !== this.config.trustDomain) {
+        throw new Error('Permission denied: resource outside this session trust domain');
+      }
+      const row = await this.adapter.resolve(uri);
       return {
         contents: [
           {
-            uri: req.params.uri,
+            uri,
             mimeType: 'application/json',
             text: JSON.stringify(row?.envelope ?? row ?? { error: 'Not found' }),
           },
@@ -265,7 +277,7 @@ export class CARMAMCPServer {
         const embedding = toVectorLiteral(await embed(String(args.query ?? '')));
         const rows = await this.adapter.search({
           embedding,
-          k: args.k ?? 5,
+          k: Math.min(Math.max(1, Number(args.k) || 5), 50),
           trustDomain: this.config.trustDomain,
           weights: this.config.recallWeights,
         });
