@@ -4,11 +4,31 @@ import {
   ReadResourceRequestSchema,
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  McpError,
+  ErrorCode,
 } from '@modelcontextprotocol/sdk/types.js';
 import { storeTrace, newTraceUri, recordOutcome, retractMemory } from '../ingest.js';
+import type { ConsolidationPolicy } from '../ingest.js';
 import { embed, toVectorLiteral } from '../embedding.js';
 import { toPrecedent } from '../recall.js';
 import { composeWake } from '../wake/wake.js';
+import { sanitizeUri } from '../middleware/guardrails.js';
+import { validateTraceInput, validateOutcome, clampInt } from '../validate.js';
+
+function domainOf(uri: string): string | null {
+  const parts = uri.split('://');
+  return parts.length > 1 ? parts[1].split('/')[0] : null;
+}
+
+// One audit row per tool call / resource read (allow, deny, error) — the same
+// trail the REST routes leave, written by the transport that owns the actor.
+export interface AuditEntry {
+  action: string;
+  result: 'allow' | 'deny' | 'error';
+  uri?: string;
+  trustDomain?: string;
+  detail?: any;
+}
 
 export interface MCPConfig {
   trustDomain: string;
@@ -18,16 +38,45 @@ export interface MCPConfig {
   // is derived from the caller's capability token so the same governance model
   // applies across transports.
   allowedActions?: string[];
+  // Actor recorded in envelope provenance and audit rows: the token subject for
+  // HTTP sessions, 'mcp-stdio' for the local channel.
+  subject?: string;
   // Optional precedent-recall weights (see adapters/postgres.ts). Defaults apply
   // when omitted.
   recallWeights?: { sim?: number; outcome?: number; recency?: number; halfLifeDays?: number };
   // Wake layer sizes for the `wake` tool / resource (defaults apply when omitted).
   wake?: { recent?: number; identity?: number; relevant?: number };
+  // Consolidation policy for store_trace (CONSOLIDATE_SIM_THRESHOLD, tier
+  // admission) — the same one POST /memory applies.
+  policy?: ConsolidationPolicy;
+  // Input limits shared with the REST API (CONTENT_MAX_LENGTH, ...).
+  limits?: { contentMaxLength?: number; boundContextMax?: number; searchKMax?: number };
   // Optional text surfaced as the MCP `initialize` `instructions` — used to
   // carry the agent's wake brief (identity + recent) so a harness reloads its
   // self on connect. Computed per session before the server is constructed.
   instructions?: string;
+  audit?: (entry: AuditEntry) => void;
 }
+
+// Messages a client may see verbatim: validation and not-found errors. Anything
+// else (driver errors, signing-key state) is reported generically; the raw
+// message goes to the audit sink only.
+const CLIENT_SAFE =
+  /^(trace |task |content |boundContext|decision|outcome|confidence|importance|supersedes|occurredAt|Invalid URI|Invalid scheme|Path traversal|URI too long|Decision not found|Memory not found|Decision belongs|Memory belongs)/;
+
+function safeMessage(e: any): string {
+  const m = e?.message || String(e);
+  return CLIENT_SAFE.test(m) ? m : 'internal error';
+}
+
+// Audit action names match the REST routes so one query covers both transports.
+const ACTION_OF: Record<string, string> = {
+  store_trace: 'write',
+  record_outcome: 'outcome',
+  retract_memory: 'retract',
+  search_memory: 'search',
+  wake: 'wake',
+};
 
 // MCP server exposing CARMA to agents over any MCP transport (stdio for local
 // harnesses, Streamable HTTP for remote ones). A stdio connection is treated as
@@ -40,6 +89,29 @@ export class CARMAMCPServer {
   private allows(action: string): boolean {
     const allowed = this.config.allowedActions;
     return !allowed || allowed.includes(action);
+  }
+
+  private audit(entry: AuditEntry) {
+    try {
+      this.config.audit?.(entry);
+    } catch {
+      /* audit must never break a call */
+    }
+  }
+
+  // Tool outcomes are results, not protocol errors: the model sees the failure
+  // as something it can correct, and the client never receives internal text.
+  private denied(action: string, tool: string) {
+    this.audit({ action: ACTION_OF[tool] ?? tool, result: 'deny', trustDomain: this.config.trustDomain, detail: { tool, reason: `capability lacks '${action}' action` } });
+    return {
+      content: [{ type: 'text', text: `Permission denied: capability lacks '${action}' action` }],
+      isError: true,
+    };
+  }
+
+  private failed(tool: string, e: any, uri?: string) {
+    this.audit({ action: ACTION_OF[tool] ?? tool, result: 'error', uri, trustDomain: this.config.trustDomain, detail: { tool, error: e?.message || String(e) } });
+    return { content: [{ type: 'text', text: `${tool} failed: ${safeMessage(e)}` }], isError: true };
   }
 
   constructor(private adapter: any, private config: MCPConfig) {
@@ -73,21 +145,49 @@ export class CARMAMCPServer {
     }));
 
     this.server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
+      const trustDomain = this.config.trustDomain;
       if (!this.allows('read')) {
-        throw new Error("Permission denied: capability lacks 'read' action");
+        this.audit({ action: 'read', result: 'deny', uri: String(req.params.uri), trustDomain, detail: { reason: "capability lacks 'read' action" } });
+        throw new McpError(ErrorCode.InvalidRequest, "Permission denied: capability lacks 'read' action");
       }
       // The wake brief is a composed view, not a stored envelope.
       if (req.params.uri === this.wakeUri()) {
-        const payload = await this.wake();
+        let payload: any;
+        try {
+          payload = await this.wake();
+        } catch (e: any) {
+          this.audit({ action: 'wake', result: 'error', trustDomain, detail: { resource: true, error: e?.message } });
+          throw new McpError(ErrorCode.InternalError, 'internal error');
+        }
+        this.audit({ action: 'wake', result: 'allow', trustDomain, detail: { resource: true, ...payload.counts } });
         return {
           contents: [{ uri: req.params.uri, mimeType: 'application/json', text: JSON.stringify(payload) }],
         };
       }
-      const row = await this.adapter.resolve(req.params.uri);
+      // Resource reads are confined to this session's trust domain — the same
+      // rule REST /resolve applies through enforceCapability.
+      let uri: string;
+      try {
+        uri = sanitizeUri(req.params.uri);
+      } catch (e: any) {
+        throw new McpError(ErrorCode.InvalidParams, e.message);
+      }
+      if (domainOf(uri) !== trustDomain) {
+        this.audit({ action: 'read', result: 'deny', uri, trustDomain, detail: { reason: 'resource outside this session trust domain' } });
+        throw new McpError(ErrorCode.InvalidRequest, 'Permission denied: resource outside this session trust domain');
+      }
+      let row: any;
+      try {
+        row = await this.adapter.resolve(uri);
+      } catch (e: any) {
+        this.audit({ action: 'read', result: 'error', uri, trustDomain, detail: { error: e?.message } });
+        throw new McpError(ErrorCode.InternalError, 'internal error');
+      }
+      this.audit({ action: 'read', result: 'allow', uri, trustDomain, detail: { found: Boolean(row) } });
       return {
         contents: [
           {
-            uri: req.params.uri,
+            uri,
             mimeType: 'application/json',
             text: JSON.stringify(row?.envelope ?? row ?? { error: 'Not found' }),
           },
@@ -201,95 +301,102 @@ export class CARMAMCPServer {
     }));
 
     this.server.setRequestHandler(CallToolRequestSchema, async (req) => {
-      const { name, arguments: args = {} } = req.params as any;
+      const { name, arguments: rawArgs } = req.params as any;
+      const args: any = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : {};
+      const subject = this.config.subject ?? 'mcp';
+      const trustDomain = this.config.trustDomain;
+      const limits = this.config.limits;
+
       if (name === 'store_trace') {
-        if (!this.allows('write')) {
-          return {
-            content: [{ type: 'text', text: "Permission denied: capability lacks 'write' action" }],
-            isError: true,
-          };
-        }
-        const uri = newTraceUri(this.config.trustDomain);
-        const result = await storeTrace(
-          this.adapter,
-          {
-            uri,
-            trustDomain: this.config.trustDomain,
-            subject: 'mcp',
-            privateKeyPem: this.config.privateKeyPem,
-          },
-          {
-            task: args.task,
-            content: args.content,
-            boundContext: args.boundContext,
-            decision: args.decision,
-            outcome: args.outcome,
-            confidence: args.confidence,
-            importance: args.importance,
-            supersedes: args.supersedes,
+        if (!this.allows('write')) return this.denied('write', name);
+        const uri = newTraceUri(trustDomain);
+        try {
+          // The same validation POST /memory applies (types, ranges, length caps).
+          const input = validateTraceInput(args, limits);
+          if (input.supersedes && domainOf(input.supersedes) !== trustDomain) {
+            throw new Error('supersedes must reference a memory in the same trust domain');
           }
-        );
-        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+          const result = await storeTrace(
+            this.adapter,
+            { uri, trustDomain, subject, privateKeyPem: this.config.privateKeyPem },
+            input,
+            this.config.policy
+          );
+          this.audit({
+            action: 'write',
+            result: 'allow',
+            uri,
+            trustDomain,
+            detail: { tool: name, tier: result.tier, reviewQueued: Boolean(result.reviewQueued), ...(input.supersedes ? { supersedes: input.supersedes } : {}) },
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        } catch (e) {
+          return this.failed(name, e, uri);
+        }
       }
       if (name === 'record_outcome') {
-        if (!this.allows('write')) {
-          return {
-            content: [{ type: 'text', text: "Permission denied: capability lacks 'write' action" }],
-            isError: true,
-          };
+        if (!this.allows('write')) return this.denied('write', name);
+        let decisionUri: string | undefined;
+        try {
+          decisionUri = sanitizeUri(args.decisionUri);
+          if (domainOf(decisionUri) !== trustDomain) throw new Error('Decision belongs to a different trust domain');
+          const outcome = validateOutcome({ status: args.status, score: args.score, evidence: args.evidence }, limits);
+          const result = await recordOutcome(
+            this.adapter,
+            { trustDomain, subject, privateKeyPem: this.config.privateKeyPem },
+            { decisionUri, status: outcome.status, score: outcome.score, evidence: outcome.evidence }
+          );
+          this.audit({ action: 'outcome', result: 'allow', uri: decisionUri, trustDomain, detail: { tool: name, status: outcome.status, outcomeUri: result.outcomeUri } });
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        } catch (e) {
+          return this.failed(name, e, decisionUri);
         }
-        const result = await recordOutcome(
-          this.adapter,
-          { trustDomain: this.config.trustDomain, subject: 'mcp', privateKeyPem: this.config.privateKeyPem },
-          { decisionUri: String(args.decisionUri), status: args.status, score: args.score, evidence: args.evidence }
-        );
-        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
       }
       if (name === 'retract_memory') {
-        if (!this.allows('write')) {
-          return {
-            content: [{ type: 'text', text: "Permission denied: capability lacks 'write' action" }],
-            isError: true,
-          };
+        if (!this.allows('write')) return this.denied('write', name);
+        let uri: string | undefined;
+        try {
+          uri = sanitizeUri(args.uri);
+          if (domainOf(uri) !== trustDomain) throw new Error('Memory belongs to a different trust domain');
+          const result = await retractMemory(this.adapter, { trustDomain }, uri);
+          const reason = typeof args.reason === 'string' ? args.reason.slice(0, 1000) : null;
+          this.audit({ action: 'retract', result: 'allow', uri, trustDomain, detail: { tool: name, reason } });
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        } catch (e) {
+          return this.failed(name, e, uri);
         }
-        const result = await retractMemory(this.adapter, { trustDomain: this.config.trustDomain }, String(args.uri));
-        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
       }
       if (name === 'search_memory') {
-        if (!this.allows('read')) {
-          return {
-            content: [{ type: 'text', text: "Permission denied: capability lacks 'read' action" }],
-            isError: true,
-          };
+        if (!this.allows('read')) return this.denied('read', name);
+        try {
+          const query = String(args.query ?? '');
+          const k = clampInt(args.k, 5, 1, limits?.searchKMax ?? 50);
+          const embedding = toVectorLiteral(await embed(query));
+          const rows = await this.adapter.search({ embedding, k, trustDomain, weights: this.config.recallWeights });
+          const results = rows.map(toPrecedent);
+          this.audit({ action: 'search', result: 'allow', trustDomain, detail: { tool: name, q: query.slice(0, 200), k, hits: results.length } });
+          return { content: [{ type: 'text', text: JSON.stringify({ query: args.query, results }) }] };
+        } catch (e) {
+          return this.failed(name, e);
         }
-        const embedding = toVectorLiteral(await embed(String(args.query ?? '')));
-        const rows = await this.adapter.search({
-          embedding,
-          k: args.k ?? 5,
-          trustDomain: this.config.trustDomain,
-          weights: this.config.recallWeights,
-        });
-        const results = rows.map(toPrecedent);
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ query: args.query, results }) }],
-        };
       }
       if (name === 'wake') {
-        if (!this.allows('read')) {
-          return {
-            content: [{ type: 'text', text: "Permission denied: capability lacks 'read' action" }],
-            isError: true,
-          };
+        if (!this.allows('read')) return this.denied('read', name);
+        try {
+          const max = limits?.searchKMax ?? 50;
+          const payload = await this.wake({
+            task: args.task != null ? String(args.task) : null,
+            recent: clampInt(args.recent, undefined, 0, max),
+            identity: clampInt(args.identity, undefined, 0, max),
+            relevant: clampInt(args.relevant, undefined, 0, max),
+          });
+          this.audit({ action: 'wake', result: 'allow', trustDomain, detail: { tool: name, ...payload.counts } });
+          return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+        } catch (e) {
+          return this.failed(name, e);
         }
-        const payload = await this.wake({
-          task: args.task,
-          recent: args.recent,
-          identity: args.identity,
-          relevant: args.relevant,
-        });
-        return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
       }
-      throw new Error(`Unknown tool: ${name}`);
+      throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     });
   }
 

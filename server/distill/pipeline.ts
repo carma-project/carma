@@ -98,7 +98,12 @@ export async function runDistillation(adapter: any, config: any, params: Distill
   };
 }
 
+// Job ids are interpolated into provider URLs; only a plain identifier is
+// accepted so a caller cannot steer the request at another path.
+const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+
 export async function fineTuneStatus(config: any, jobId: string) {
+  if (!JOB_ID.test(String(jobId))) throw new Error('Invalid jobId');
   const provider = getFineTuneProvider(config);
   return provider.status(jobId);
 }

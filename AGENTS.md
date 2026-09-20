@@ -55,13 +55,17 @@ fails with `ERR_MODULE_NOT_FOUND`; `tsx` resolves the `.js` specifiers to their 
 ## Configuration
 
 Config is centralized and validated in `server/config.js` (`parseConfig(env)` is pure and
-unit-tested; a redacted summary is logged at boot).
+unit-tested; a redacted summary is logged at boot). A blank numeric variable means unset (the
+default applies); an unparseable or out-of-range value falls back to the default with a warning
+and fails boot under `STRICT_BOOT`.
 
 Core:
 - `PORT` — HTTP port (default `7100`).
 - `PUBLIC_KEY` — Ed25519 **SPKI PEM**. Imported at startup via `jose.importSPKI(..., 'EdDSA')`
   to verify capability tokens. If unset/invalid, the process still boots and `/health` works,
-  but authenticated endpoints return `403`.
+  but authenticated endpoints return `401`.
+- `JWT_ISSUER` / `JWT_AUDIENCE` — optional expected `iss` / `aud` on capability tokens; enforced only
+  when set. `issueCapability` (and `npm run mint-token`) stamp the same values from the environment.
 - `PRIVATE_KEY` — Ed25519 **PKCS8 PEM**. Signs stored envelopes on ingest and mints tokens.
 - `DATABASE_URL` — Postgres connection string (needs pgvector). Run `npm run migrate` first.
 - `TRUST_DOMAIN` — default trust domain for ingest/search when not supplied per-request.
@@ -73,7 +77,8 @@ Core:
 
 Production/hardening:
 - `DATABASE_SSL` — `disable` (default) | `require` (encrypt, don't verify) | `verify` (verify CA).
-  Managed Postgres (Railway/RDS) typically needs `require`.
+  Managed Postgres (Railway/RDS) typically needs `require`. Any other value fails closed to
+  `require` (shared logic in `server/dbssl.js`, used by the server and `migrate.mjs` alike).
 - `DB_POOL_MAX` / `DB_IDLE_TIMEOUT_MS` / `DB_CONNECT_TIMEOUT_MS` — pool sizing/timeouts.
 - `TOKEN_MAX_AGE_READ` (default `3600`) / `TOKEN_MAX_AGE_WRITE` (default `900`) — per-action token
   age ceilings in seconds (docs/SECURITY.md), enforced on top of `exp`.
@@ -127,14 +132,25 @@ Native ingestion (sources CARMA pulls itself):
 - `LOG_LEVEL` (`info`) — structured JSON logs; each request gets an `X-Request-Id`.
 - `HSTS_ENABLED` (`false`) — send HSTS (enable when TLS terminates at/after the proxy).
 - `STRICT_BOOT` (`false`) — fail fast at startup if `PUBLIC_KEY`/`PRIVATE_KEY`/`DATABASE_URL`
-  are missing (recommended in production).
+  are missing, `PRIVATE_KEY` does not parse or does not match `PUBLIC_KEY`, or any variable holds
+  an invalid value (recommended in production).
 - `MCP_HTTP_ENABLED` (default `true`) / `MCP_HTTP_PATH` (default `/mcp`) — expose the MCP
   Streamable HTTP transport on the main server so remote agent harnesses can connect.
+- `MCP_SESSION_IDLE_MS` (`1800000`) / `MCP_SESSION_MAX` (`1000`) — HTTP MCP sessions are closed
+  after this idle time (and at token expiry regardless); the session table is capped, evicting the
+  least recently used session.
 - `STATUS_PUBLIC` (default `false`) — when false, unauthenticated `GET /api/status` returns only
   coarse readiness booleans; the full detail (trust domain, configured sources incl. repo slugs,
   ingest state) requires a read capability. Set `true` to expose the full detail anonymously (local/dev).
 - `UI_ENABLED` (default `true`) — serve the built-in config UI at `/` and `/ui`; disable in hardened
   deployments. See `docs/EXPOSURE.md` for the no-public-listener (Zero-Trust tunnel) topology.
+- `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` — optional HTTP Basic login for every request that does
+  not carry a bearer capability token (the built-in UI, `/api/status`, anonymous probes of the API).
+  Both must be set to enable it; `/health` and `/ready` stay open for probes, and failed attempts
+  spend the client's rate-limit budget. Requests with a bearer token are unaffected (MCP harnesses,
+  API clients). A request carrying the login also gets the full `/api/status` detail, so the built-in
+  UI works behind it without `STATUS_PUBLIC`. Use it to put a preview or internal deployment on a
+  public domain.
 - `WAKE_RECENT` (`5`) / `WAKE_IDENTITY` (`8`) / `WAKE_RELEVANT` (`5`) — layer sizes for the
   session-start "wake" brief (`POST /wake`, MCP `wake` tool, `memory://<domain>/wake` resource):
   how many recent decisions, identity/self memories, and (when a task is given) relevant precedents.
@@ -161,8 +177,10 @@ Native ingestion (sources CARMA pulls itself):
   Without `STATUS_PUBLIC=true`, anonymous callers get only coarse readiness (`ready` + component
   booleans); full detail (trust domain, sources, ingest state) requires a read capability.
 - `GET /health` — liveness (always `200` while the process is up).
-- `GET /ready` — readiness (`200` only when it can serve: key valid + DB connected + schema);
-  `503` otherwise. Use this for orchestrator readiness probes.
+- `GET /ready` — readiness (`200` only when it can serve: `PUBLIC_KEY` valid, `PRIVATE_KEY` parses
+  and matches it, DB connected, schema + pgvector + audit table present); `503` otherwise, with a
+  boolean per component. `/api/status.ready` is the same predicate. Use this for orchestrator
+  readiness probes.
 - `POST /capability` — mTLS-gated capability issuance/refresh (off unless
   `CAPABILITY_ENDPOINT_ENABLED`). No bearer token; the caller is authenticated by a client cert
   (direct TLS) or a trusted proxy's forwarded identity. Body: `{ domains?, actions?, ttl? }`
@@ -232,8 +250,13 @@ reloads the agent's identity/self automatically — the fix for losing personali
   for remote/networked harnesses. A session is opened by an authenticated `initialize` (bearer
   capability token in `Authorization`). Per-session tool permissions are derived from the token's
   `jsonam.actions`: `search_memory`/resource reads need `read`, `store_trace` needs `write`.
-  Denials return an MCP `isError` result rather than crashing the client. Connect with the MCP
-  SDK's `StreamableHTTPClientTransport` (or any client that speaks MCP Streamable HTTP).
+  Denials and tool failures return an MCP `isError` result with a client-safe message (validation
+  and not-found text only; driver/config detail stays in the audit row). Every tool call and
+  resource read is audited under the token subject, which also stamps envelope provenance. Tool
+  arguments pass the same validation as the REST body (`server/validate.js`). A request naming an
+  unknown or expired session gets `404` so the client re-initializes; `/mcp` shares the rate limiter
+  and `BODY_LIMIT_BYTES` with the REST routes. Connect with the MCP SDK's
+  `StreamableHTTPClientTransport` (or any client that speaks MCP Streamable HTTP).
 
 ## Testing
 
@@ -241,8 +264,9 @@ Verify with terminal requests. With the server on `:7100`:
 
 - `curl http://localhost:7100/health` -> `ok` (HTTP 200)
 - `curl http://localhost:7100/api/status` -> JSON; `"ready":true` once fully configured
-- No token -> `403 Forbidden: Missing token`; invalid JWT / wrong domain / missing action -> `403`
-- Disallowed scheme / path traversal in `uri` -> `403` (`server/middleware/guardrails.ts`)
+- No token / invalid or expired JWT -> `401 {"error":"Unauthorized"}`; wrong domain / missing action -> `403 {"error":"Forbidden"}`
+  (the reason is written to the log and audit entry, never echoed to the client)
+- Disallowed scheme / path traversal in `uri` -> `400` (`server/middleware/guardrails.ts`)
 - `POST /memory` with a `write` token -> `201 {uri, stored:true}`; then `GET /search?q=...`
   returns that pointer ranked by similarity; `GET /resolve?uri=...` returns the signed envelope.
 
@@ -272,16 +296,21 @@ The full stack (app + pgvector Postgres, migrations auto-applied) runs locally v
 
 - **AuthZ depth**: capability verify (`jwt.ts`) + per-action token-age ceiling
   (`enforceTokenLifetime`) + domain/action enforcement (`enforceCapability`).
-- **Audit**: every access decision (allow/deny/error) is written to the append-only
-  `audit_log` table (`server/audit.js`, best-effort — never breaks the request path).
-- **Rate limiting**: per-client token bucket (`server/ratelimit.js`) on authenticated routes.
-- **Input hardening**: JSON body size cap, trace content/boundContext limits, `k` cap; consistent
-  JSON error envelopes.
+- **Audit**: every access decision (allow/deny/error), over REST and MCP, is written to the
+  append-only `audit_log` table (`server/audit.js`, best-effort — never breaks the request path).
+  MCP session ids appear only as a one-way reference.
+- **Rate limiting**: per-client token bucket (`server/ratelimit.js`) on authenticated routes and `/mcp`.
+- **Input hardening**: JSON body size cap (REST and MCP), trace content/decision/boundContext
+  limits and `k` clamps shared by both transports (`server/validate.js`); consistent JSON error
+  envelopes.
 - **Observability**: structured JSON logs with per-request `X-Request-Id`; security headers
   (`nosniff`, `no-referrer`, optional HSTS).
-- **Lifecycle**: graceful `SIGTERM`/`SIGINT` shutdown (drain server, close pool); `uncaughtException`
-  exits for orchestrator restart; pool `error` handler prevents idle-client crashes.
-- **Migrations**: `npm run migrate` takes a pg advisory lock so concurrent replicas don't race.
+- **Lifecycle**: graceful `SIGTERM`/`SIGINT` shutdown (close MCP streams, let an in-flight ingest
+  finish, drain the listener, close the pool; exit `0`); `uncaughtException` exits for orchestrator
+  restart; pool `error` handler prevents idle-client crashes.
+- **Migrations**: `npm run migrate` takes a pg advisory lock so concurrent replicas don't race, and
+  retries with backoff while the database is still coming up (a boot-time transient never crash-loops
+  the container).
 
 ## Consolidation & tiers (human-like memory management)
 

@@ -103,18 +103,21 @@ export class PostgresAdapter {
       VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10, $11, $12, $13, $14, COALESCE($15::timestamptz, now()))
       ON CONFLICT (uri) DO UPDATE SET
         kind = EXCLUDED.kind,
-        trust_domain = EXCLUDED.trust_domain,
         envelope = EXCLUDED.envelope,
         signature = EXCLUDED.signature,
         content = EXCLUDED.content,
         embedding = EXCLUDED.embedding,
-        status = EXCLUDED.status,
-        supersedes = EXCLUDED.supersedes,
-        outcome_status = EXCLUDED.outcome_status,
-        outcome_score = EXCLUDED.outcome_score,
-        confidence = EXCLUDED.confidence,
-        importance = EXCLUDED.importance,
-        tier = EXCLUDED.tier
+        supersedes = COALESCE(EXCLUDED.supersedes, agent_memory.supersedes),
+        -- Lifecycle decisions (retract/archive/supersede, pin/consolidate,
+        -- recorded outcomes) survive a re-ingest of the same URI.
+        status = CASE WHEN agent_memory.status IN ('retracted', 'archived', 'superseded') THEN agent_memory.status ELSE EXCLUDED.status END,
+        tier = CASE WHEN agent_memory.tier IN ('pinned', 'consolidated') THEN agent_memory.tier ELSE EXCLUDED.tier END,
+        outcome_status = COALESCE(EXCLUDED.outcome_status, agent_memory.outcome_status),
+        outcome_score = COALESCE(EXCLUDED.outcome_score, agent_memory.outcome_score),
+        confidence = COALESCE(EXCLUDED.confidence, agent_memory.confidence),
+        importance = COALESCE(EXCLUDED.importance, agent_memory.importance)
+      -- A URI never moves between trust domains.
+      WHERE agent_memory.trust_domain = EXCLUDED.trust_domain
       RETURNING uri`;
     const res = await this.pool.query(query, [
       rec.uri,
@@ -323,7 +326,9 @@ export class PostgresAdapter {
     const simExpr = `(1 - (embedding <=> $1::vector))`;
     // Neutral (0) when no outcome is known, so undecided memories aren't penalized.
     const outExpr = `COALESCE(outcome_score, CASE outcome_status WHEN 'success' THEN 1 WHEN 'failure' THEN -1 WHEN 'mixed' THEN 0 ELSE 0 END, 0)`;
-    const recExpr = `EXP(- EXTRACT(EPOCH FROM (now() - created_at)) / $${pHalf})`;
+    // A true half-life: the term is 0.5 at RECALL_HALF_LIFE_DAYS. Age is
+    // clamped at zero so a future-dated row cannot inflate its own score.
+    const recExpr = `EXP(- LN(2) * GREATEST(0, EXTRACT(EPOCH FROM (now() - created_at))) / $${pHalf})`;
     // Bounded reinforcement bonus in [0,1); recurring memories surface higher.
     const reinfExpr = `(1 - EXP(- reinforcement_count::float / 3))`;
     // Slight additive boost for human-pinned memories (not an override).
@@ -386,10 +391,12 @@ export class PostgresAdapter {
     return res.rows[0].n;
   }
 
-  // Bulk selection of stored envelopes for distillation/export.
-  async listEnvelopes(opts: { trustDomain?: string | null; kind?: string | null; since?: string | null; limit?: number } = {}) {
+  // Bulk selection of stored envelopes for distillation/export. Only active
+  // memories by default: retracted, superseded and archived material must not
+  // become training data.
+  async listEnvelopes(opts: { trustDomain?: string | null; kind?: string | null; since?: string | null; limit?: number; includeInactive?: boolean } = {}) {
     const params: any[] = [];
-    let where = 'envelope IS NOT NULL';
+    let where = opts.includeInactive ? 'envelope IS NOT NULL' : "envelope IS NOT NULL AND status = 'active'";
     if (opts.trustDomain) {
       params.push(opts.trustDomain);
       where += ` AND trust_domain = $${params.length}`;

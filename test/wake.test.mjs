@@ -101,7 +101,7 @@ test(
 
       // --- 1) HTTP /wake is read-gated ----------------------------------------
       const noAuth = await reqJson('POST', '/wake', null, {});
-      assert.equal(noAuth.status, 403, 'wake requires a token');
+      assert.equal(noAuth.status, 401, 'wake requires a token');
 
       // --- 2) HTTP /wake composes identity + recent (no task) -----------------
       const wake = (await reqJson('POST', '/wake', roToken, {})).json;

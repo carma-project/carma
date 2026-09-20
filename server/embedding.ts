@@ -7,7 +7,10 @@
 // real semantic model (e.g. an external embeddings API) can be dropped in;
 // switching providers requires matching EMBED_DIM and re-embedding stored rows.
 
-export const EMBED_DIM = Number(process.env.EMBED_DIM || 256);
+// Blank or malformed values fall back to the column width the migrations
+// create; a zero dimension would make every hash NaN and every write fail.
+const rawDim = Number(process.env.EMBED_DIM);
+export const EMBED_DIM = Number.isInteger(rawDim) && rawDim > 0 ? rawDim : 256;
 const PROVIDER = process.env.EMBEDDING_PROVIDER || 'local';
 
 function hashToken(tok: string): number {

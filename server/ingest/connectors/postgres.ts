@@ -40,7 +40,15 @@ export async function collectPostgres(source: any, _config: any, ctx: CollectCon
   const items: IngestItem[] = [];
   await client.connect();
   try {
-    const res = await client.query(source.query);
+    // The connector is documented as read-only; a read-only transaction makes
+    // Postgres enforce that whatever privileges the role happens to hold.
+    await client.query('BEGIN READ ONLY');
+    let res;
+    try {
+      res = await client.query(source.query);
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+    }
     for (const row of res.rows) {
       const rawId = row[idCol];
       if (rawId == null) continue;

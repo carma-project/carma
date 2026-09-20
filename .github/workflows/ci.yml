@@ -32,3 +32,61 @@ jobs:
       - run: npm ci
       - run: npm run migrate
       - run: npm test
+
+  # The deployable artifact is the container image, not the checkout: build it,
+  # boot it against pgvector with throwaway keys, wait for /ready, and run the
+  # end-to-end smoke test against it.
+  image:
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: carma
+          POSTGRES_PASSWORD: carma
+          POSTGRES_DB: carma
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U carma -d carma"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: docker build -t carma:ci .
+      - name: Generate throwaway Ed25519 keys
+        run: |
+          node -e '
+          const { generateKeyPairSync } = require("crypto");
+          const fs = require("fs");
+          const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+          fs.writeFileSync("ci-pub.pem", publicKey.export({ type: "spki", format: "pem" }));
+          fs.writeFileSync("ci-priv.pem", privateKey.export({ type: "pkcs8", format: "pem" }));'
+      - name: Boot the image (migrations run on start)
+        run: |
+          docker run -d --name carma --network host \
+            -e DATABASE_URL=postgres://carma:carma@localhost:5432/carma \
+            -e TRUST_DOMAIN=ci -e STRICT_BOOT=true -e LOG_LEVEL=info \
+            -e PUBLIC_KEY="$(cat ci-pub.pem)" -e PRIVATE_KEY="$(cat ci-priv.pem)" \
+            carma:ci
+          for i in $(seq 1 45); do
+            if curl -fsS http://localhost:7100/ready > /dev/null 2>&1; then
+              echo "ready after ${i} checks"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "image did not become ready"
+          docker logs carma
+          exit 1
+      - run: npm ci
+      - name: Smoke test against the running image
+        run: PRIVATE_KEY="$(cat ci-priv.pem)" TRUST_DOMAIN=ci PORT=7100 npm run smoke
+      - name: Container logs
+        if: always()
+        run: docker logs carma || true

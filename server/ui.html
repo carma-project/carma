@@ -174,14 +174,40 @@ function render() {
   }
 }
 
+// Without STATUS_PUBLIC (and without the operator login or a read capability)
+// the API answers with coarse readiness booleans only. Lift that shape into
+// the detailed one so every check still renders instead of throwing.
+function normalize(s) {
+  if (!s || typeof s !== 'object') return { publicKey: {}, database: {}, ready: false };
+  if (s.publicKey || !s.components) return s;
+  const c = s.components;
+  return {
+    ready: !!s.ready,
+    coarse: true,
+    publicKey: { configured: !!c.publicKey, valid: !!c.publicKey },
+    privateKey: { configured: !!c.privateKey },
+    database: { configured: !!c.database, connected: !!c.database, schemaReady: !!c.schema },
+    rag: { ready: !!c.rag },
+    audit: { ready: !!c.audit },
+  };
+}
+
 async function load() {
   try {
     const res = await fetch('/api/status', { cache: 'no-store' });
-    state = await res.json();
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    state = normalize(await res.json());
   } catch (e) {
     state = { publicKey:{}, database:{}, ready:false, _err: String(e) };
   }
-  render();
+  try {
+    render();
+  } catch (e) {
+    const pill = document.getElementById('overallPill');
+    pill.className = 'pill notready'; pill.textContent = 'ERROR';
+    document.getElementById('overallDesc').textContent = 'Could not render status: ' + e;
+  }
+  if (state._err) document.getElementById('overallDesc').innerHTML = 'Could not load <code>/api/status</code>: ' + esc(state._err);
 }
 
 document.getElementById('refresh').addEventListener('click', load);

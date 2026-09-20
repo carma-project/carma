@@ -1,15 +1,13 @@
+# Equivalent of the Dockerfile for Nixpacks builders: git for the native
+# ingestion engine (it shells out to clone/fetch), production dependencies only.
 [phases.setup]
-    nixPkgs = ["nodejs_20"]
+    nixPkgs = ["nodejs_20", "git"]
 
 [phases.install]
-    cmd = "npm ci"
-
-[phases.build]
-    cmd = ""
+    cmds = ["npm ci --omit=dev"]
 
 # Apply migrations (idempotent, advisory-locked) before the server starts, so a
 # fresh Railway deploy comes up with a ready schema. Requires a pgvector-enabled
 # Postgres (migration 0002 runs CREATE EXTENSION vector) and DATABASE_URL set.
 [start]
     cmd = "node adapters/migrate.mjs && node --import tsx server/index.js"
-    port = 7100
