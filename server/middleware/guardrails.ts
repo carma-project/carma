@@ -50,6 +50,7 @@ export function validateEnvelope(envelope: any) {
 
 export function sanitizeUri(uri: unknown): string {
   if (typeof uri !== 'string') throw new Error('Invalid URI');
+  if (uri.length > 2048) throw new Error('URI too long');
   if (!URI_PATTERN.test(uri)) throw new Error('Invalid scheme');
   if (uri.includes('..')) throw new Error('Path traversal');
   return uri;

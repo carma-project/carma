@@ -55,8 +55,10 @@ export function clientIdentity(req, config) {
 function directIdentity(req) {
   const socket = req.socket;
   if (!socket || typeof socket.getPeerCertificate !== 'function') return null;
-  // `authorized` is only true when the peer presented a cert that chained to a
-  // configured CA. Without requestCert/ca it is false, so this fails closed.
+  // `authorized` is true when the peer cert chained to the listener's `ca`.
+  // The listener is only ever created with CAPABILITY_CLIENT_CA as that `ca`
+  // (server/config.js refuses direct TLS without it), so a public-CA client
+  // cert can never satisfy this check.
   if (!socket.authorized) return null;
   const cert = socket.getPeerCertificate();
   if (!cert || Object.keys(cert).length === 0) return null;

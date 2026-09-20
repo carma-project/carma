@@ -2,11 +2,13 @@ import http from 'http';
 import https from 'https';
 import url from 'url';
 import { readFileSync } from 'fs';
-import { randomUUID } from 'crypto';
-import { importSPKI } from 'jose';
+import { randomUUID, createHash } from 'crypto';
+import { importSPKI, importPKCS8, CompactSign, compactVerify } from 'jose';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { verifyCapability } from './middleware/jwt.js';
 import { enforceCapability, sanitizeUri, enforceTokenLifetime } from './middleware/guardrails.js';
+import { validateTraceInput, validateOutcome, clampInt, isPlainObject } from './validate.js';
 import { issueCapability } from './capability.js';
 import { clientIdentity } from './mtls.js';
 import { boundGrant } from './capability_issue.js';
@@ -39,6 +41,34 @@ if (config.publicKeyPem) {
     logger.error('public_key_import_failed', { error: e.message });
   }
 }
+
+// PRIVATE_KEY is parsed at boot and, when PUBLIC_KEY is also present, the pair
+// is probed with a sign/verify round trip. A malformed key or a mismatched
+// pair otherwise surfaces only as every signed write and every minted token
+// failing while readiness stays green.
+let privateKeyValid = false;
+let keypairMatch = null; // true | false | null (undetermined)
+if (config.privateKeyPem) {
+  try {
+    const privateKey = await importPKCS8(config.privateKeyPem, 'EdDSA');
+    privateKeyValid = true;
+    if (publicKey) {
+      const probe = await new CompactSign(new TextEncoder().encode('carma-keypair-probe'))
+        .setProtectedHeader({ alg: 'EdDSA' })
+        .sign(privateKey);
+      try {
+        await compactVerify(probe, publicKey);
+        keypairMatch = true;
+      } catch {
+        keypairMatch = false;
+        logger.error('keypair_mismatch', { detail: 'PRIVATE_KEY does not correspond to PUBLIC_KEY; tokens it mints will not verify' });
+      }
+    }
+  } catch (e) {
+    logger.error('private_key_import_failed', { error: e.message });
+  }
+}
+const signingReady = privateKeyValid && keypairMatch !== false;
 
 const adapter = new PostgresAdapter(config.databaseUrl, {
   ssl: config.dbSslConfig,
@@ -89,8 +119,8 @@ async function runSourceTracked(source, opts = {}) {
 }
 
 for (const w of config.warnings) logger.warn('config_warning', { detail: w });
-if (config.strictBoot && (!publicKey || !config.privateKeyPem || !config.databaseUrl)) {
-  logger.error('strict_boot_failed', { summary: redactedSummary(config) });
+if (config.strictBoot && (!publicKey || !signingReady || !config.databaseUrl || config.fatal.length)) {
+  logger.error('strict_boot_failed', { invalid: config.fatal, keypairMatch, summary: redactedSummary(config) });
   process.exit(1);
 }
 
@@ -137,26 +167,39 @@ function clientKey(req) {
   return req.socket?.remoteAddress || 'unknown';
 }
 
-function readJsonBody(req, limitBytes) {
+// Read a JSON body of at most `limitBytes` bytes. Chunks are accumulated as
+// bytes and decoded once, so a multi-byte character straddling a chunk
+// boundary is never corrupted. The top level must be an object (or, for
+// JSON-RPC batches, an array when allowArray is set) so a bare string or null
+// cannot reach a handler as `body`.
+function readJsonBody(req, limitBytes, { allowArray = false } = {}) {
   return new Promise((resolve, reject) => {
-    let data = '';
+    const chunks = [];
+    let size = 0;
     let aborted = false;
     req.on('data', (chunk) => {
       if (aborted) return;
-      data += chunk;
-      if (data.length > limitBytes) {
+      size += chunk.length;
+      if (size > limitBytes) {
         aborted = true;
         reject(new Error('Body too large'));
+        return;
       }
+      chunks.push(chunk);
     });
     req.on('end', () => {
       if (aborted) return;
-      if (!data) return resolve({});
+      const data = Buffer.concat(chunks).toString('utf8');
+      if (!data.trim()) return resolve({});
+      let parsed;
       try {
-        resolve(JSON.parse(data));
+        parsed = JSON.parse(data);
       } catch {
-        reject(new Error('Invalid JSON body'));
+        return reject(new Error('Invalid JSON body'));
       }
+      const ok = isPlainObject(parsed) || (allowArray && Array.isArray(parsed));
+      if (!ok) return reject(new Error(allowArray ? 'Body must be a JSON object or array' : 'Body must be a JSON object'));
+      resolve(parsed);
     });
     req.on('error', reject);
   });
@@ -191,13 +234,68 @@ function rateLimited(req, res, requestId) {
   return true;
 }
 
+// One readiness predicate for /ready and /api/status: a verification key, a
+// usable signing key, and a connected database with the schema, pgvector and
+// the audit table in place. Anything less cannot serve writes or recall, so it
+// must not receive traffic.
+async function readiness() {
+  const components = { publicKey: publicKey !== null, privateKey: signingReady, database: false, schema: false, rag: false, audit: false };
+  let error = null;
+  if (config.databaseUrl) {
+    try {
+      const r = await adapter.check();
+      components.database = r.connected;
+      components.schema = r.schemaReady;
+      components.rag = r.ragReady;
+      components.audit = r.auditReady;
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  return { ready: Object.values(components).every(Boolean), components, error };
+}
+
 // ---------- MCP over Streamable HTTP ----------
 // Any MCP-compatible agent harness (local or remote) can connect here for
 // memory recall/ingest. Sessions are opened by an initialize POST carrying a
 // capability token; per-session tool permissions are derived from that token,
 // so the same governance model applies as the REST API. CARMA is not tied to
 // any single agent framework or model provider — it speaks the open protocol.
-const mcpSessions = new Map(); // sessionId -> StreamableHTTPServerTransport
+const mcpSessions = new Map(); // sessionId -> { transport, expiresAt, lastSeenAt, subject }
+
+// A session id is a bearer credential after initialize, so logs and audit rows
+// carry a one-way reference to it, never the id itself.
+function sessionRef(sid) {
+  return createHash('sha256').update(String(sid)).digest('hex').slice(0, 12);
+}
+
+function closeMcpSession(sid, reason) {
+  const s = mcpSessions.get(sid);
+  if (!s) return;
+  mcpSessions.delete(sid);
+  logger.info('mcp_session_close', { session: sessionRef(sid), reason });
+  Promise.resolve(s.transport.close()).catch(() => {});
+}
+
+// Abandoned sessions (a harness that crashed, slept, or reconnected without a
+// DELETE) would otherwise stay registered — and valid — for the life of the
+// process. Expired or idle sessions are closed on a timer and the map is capped.
+function sweepMcpSessions(now = Date.now()) {
+  for (const [sid, s] of mcpSessions) {
+    if (now > s.expiresAt) closeMcpSession(sid, 'expired');
+    else if (now - s.lastSeenAt > config.mcpSessionIdleMs) closeMcpSession(sid, 'idle');
+  }
+}
+
+function evictOldestMcpSession() {
+  let oldest = null;
+  for (const entry of mcpSessions) if (!oldest || entry[1].lastSeenAt < oldest[1].lastSeenAt) oldest = entry;
+  if (oldest) closeMcpSession(oldest[0], 'capacity');
+}
+
+function sendRpcError(res, status, code, message) {
+  return sendJson(res, status, { jsonrpc: '2.0', error: { code, message }, id: null });
+}
 
 async function authorizeMcp(req) {
   const token = bearerToken(req);
@@ -221,23 +319,43 @@ async function authorizeMcp(req) {
 }
 
 async function handleMcp(req, res, requestId) {
-  const sessionId = req.headers['mcp-session-id'];
-  const existing = typeof sessionId === 'string' ? mcpSessions.get(sessionId) : undefined;
-  if (existing) {
-    if (Date.now() > existing.expiresAt) {
-      mcpSessions.delete(sessionId);
-      audit.record({ action: 'mcp_session', result: 'deny', requestId, detail: { reason: 'session expired', sessionId } });
-      Promise.resolve(existing.transport.close()).catch(() => {});
-      res.setHeader('WWW-Authenticate', 'Bearer');
-      return sendJson(res, 401, { error: 'Unauthorized' });
+  // The same per-client limiter as every authenticated REST route.
+  if (rateLimited(req, res, requestId)) return;
+
+  // The body is read here, under BODY_LIMIT_BYTES, and handed to the SDK
+  // pre-parsed — left to itself the transport reads it unbounded.
+  let body;
+  if (req.method === 'POST') {
+    try {
+      body = await readJsonBody(req, config.bodyLimitBytes, { allowArray: true });
+    } catch (e) {
+      if (/too large/i.test(e.message)) return sendRpcError(res, 413, -32000, 'Request body too large');
+      return sendRpcError(res, 400, -32700, 'Parse error');
     }
-    return existing.transport.handleRequest(req, res);
   }
 
-  // No session yet — only an initialize POST may open one, and it must be
-  // authenticated. GET/DELETE without a valid session id are rejected.
-  if (req.method !== 'POST') {
-    return sendJson(res, 400, { error: 'Missing or unknown mcp-session-id' });
+  const sessionId = req.headers['mcp-session-id'];
+  if (typeof sessionId === 'string') {
+    const existing = mcpSessions.get(sessionId);
+    // Unknown or expired: 404 (the Streamable HTTP contract), so a client
+    // starts a fresh, re-authenticated session instead of retrying forever —
+    // e.g. after every CARMA restart.
+    if (!existing) return sendRpcError(res, 404, -32001, 'Session not found');
+    if (Date.now() > existing.expiresAt) {
+      audit.record({ actor: existing.subject, action: 'mcp_session', result: 'deny', requestId, detail: { reason: 'session expired', session: sessionRef(sessionId) } });
+      closeMcpSession(sessionId, 'expired');
+      return sendRpcError(res, 404, -32001, 'Session not found');
+    }
+    existing.lastSeenAt = Date.now();
+    return existing.transport.handleRequest(req, res, body);
+  }
+
+  // No session: only an authenticated initialize POST may open one. Anything
+  // else is refused before a token is verified or a wake brief is composed.
+  if (req.method !== 'POST') return sendRpcError(res, 400, -32000, 'Missing mcp-session-id');
+  const messages = Array.isArray(body) ? body : [body];
+  if (!messages.some(isInitializeRequest)) {
+    return sendRpcError(res, 400, -32000, 'Bad Request: no session; send an initialize request first');
   }
 
   let grant;
@@ -249,17 +367,19 @@ async function handleMcp(req, res, requestId) {
     return sendJson(res, 401, { error: 'Unauthorized' });
   }
 
+  if (mcpSessions.size >= config.mcpSessionMax) evictOldestMcpSession();
+
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
     onsessioninitialized: (sid) => {
-      mcpSessions.set(sid, { transport, expiresAt: grant.expiresAt });
-      logger.info('mcp_session_open', { requestId, sessionId: sid, actor: grant.sub });
-      audit.record({ actor: grant.sub, action: 'mcp_connect', result: 'allow', requestId, detail: { sessionId: sid, actions: grant.actions } });
+      mcpSessions.set(sid, { transport, expiresAt: grant.expiresAt, lastSeenAt: Date.now(), subject: grant.sub });
+      logger.info('mcp_session_open', { requestId, session: sessionRef(sid), actor: grant.sub });
+      audit.record({ actor: grant.sub, action: 'mcp_connect', result: 'allow', requestId, detail: { session: sessionRef(sid), actions: grant.actions } });
     },
   });
   transport.onclose = () => {
     const sid = transport.sessionId;
-    if (sid && mcpSessions.delete(sid)) logger.info('mcp_session_close', { sessionId: sid });
+    if (sid && mcpSessions.delete(sid)) logger.info('mcp_session_close', { session: sessionRef(sid), reason: 'client' });
   };
 
   // Compose the wake brief once, up front, so it can ride along on the MCP
@@ -286,79 +406,28 @@ async function handleMcp(req, res, requestId) {
     trustDomain: config.trustDomain,
     privateKeyPem: config.privateKeyPem,
     allowedActions: grant.actions,
+    subject: grant.sub,
     recallWeights: weightsFromConfig(config),
     wake: wakeDefaultsFromConfig(config),
+    policy: policyFromConfig(config),
+    limits: { contentMaxLength: config.contentMaxLength, boundContextMax: config.boundContextMax, searchKMax: config.searchKMax },
     instructions,
+    // Every tool call and resource read leaves the same audit trail as the
+    // REST routes, attributed to the token subject.
+    audit: (entry) =>
+      audit.record({
+        actor: grant.sub,
+        requestId,
+        ...entry,
+        detail: { ...(entry.detail || {}), transport: 'mcp', session: transport.sessionId ? sessionRef(transport.sessionId) : null },
+      }),
   });
   await carma.server.connect(transport);
-  return transport.handleRequest(req, res);
+  return transport.handleRequest(req, res, body);
 }
 
-function validateTraceInput(body) {
-  const task = body.task ?? null;
-  const content = body.content ?? null;
-  if (task != null && typeof task !== 'string') throw new Error('task must be a string');
-  if (content != null && typeof content !== 'string') throw new Error('content must be a string');
-  if (!task && !content) throw new Error('trace requires task or content');
-  if ((task || '').length + (content || '').length > config.contentMaxLength) {
-    throw new Error('trace content exceeds limit');
-  }
-  let boundContext = body.boundContext ?? [];
-  if (!Array.isArray(boundContext)) throw new Error('boundContext must be an array');
-  if (boundContext.length > config.boundContextMax) throw new Error('boundContext too large');
-  if (!boundContext.every((x) => typeof x === 'string')) throw new Error('boundContext must be strings');
-
-  let decision = null;
-  if (body.decision != null) {
-    if (typeof body.decision !== 'object' || typeof body.decision.choice !== 'string') {
-      throw new Error('decision must be an object with a string choice');
-    }
-    if (body.decision.alternatives != null && !Array.isArray(body.decision.alternatives)) {
-      throw new Error('decision.alternatives must be an array');
-    }
-    decision = { choice: body.decision.choice, ...(body.decision.alternatives ? { alternatives: body.decision.alternatives } : {}) };
-  }
-
-  let outcome = null;
-  if (body.outcome != null) {
-    outcome = validateOutcome(body.outcome);
-  }
-
-  const confidence = numInRange(body.confidence, 'confidence', 0, 1);
-  const importance = numInRange(body.importance, 'importance', 0, 1);
-
-  let supersedes = null;
-  if (body.supersedes != null) supersedes = sanitizeUri(body.supersedes);
-
-  let occurredAt = null;
-  if (body.occurredAt != null) {
-    if (typeof body.occurredAt !== 'string' || Number.isNaN(Date.parse(body.occurredAt))) {
-      throw new Error('occurredAt must be an ISO 8601 date string');
-    }
-    if (Date.parse(body.occurredAt) > Date.now() + 5 * 60 * 1000) throw new Error('occurredAt cannot be in the future');
-    occurredAt = new Date(body.occurredAt).toISOString();
-  }
-
-  return { task, content, boundContext, decision, outcome, confidence, importance, supersedes, occurredAt };
-}
-
-const OUTCOME_STATUSES = ['pending', 'success', 'failure', 'mixed', 'unknown'];
-
-function numInRange(v, name, lo, hi) {
-  if (v == null) return null;
-  if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`${name} must be a number`);
-  if (v < lo || v > hi) throw new Error(`${name} must be in [${lo}, ${hi}]`);
-  return v;
-}
-
-function validateOutcome(o) {
-  if (typeof o !== 'object') throw new Error('outcome must be an object');
-  if (!OUTCOME_STATUSES.includes(o.status)) throw new Error(`outcome.status must be one of ${OUTCOME_STATUSES.join(', ')}`);
-  const score = numInRange(o.score, 'outcome.score', -1, 1);
-  if (o.evidence != null && typeof o.evidence !== 'string') throw new Error('outcome.evidence must be a string');
-  if ((o.evidence || '').length > config.contentMaxLength) throw new Error('outcome.evidence exceeds limit');
-  return { status: o.status, ...(score != null ? { score } : {}), ...(o.evidence ? { evidence: o.evidence } : {}) };
-}
+// Trace/outcome validation lives in server/validate.js, shared with the MCP
+// tools so both transports accept exactly the same input.
 
 // ---------- server ----------
 
@@ -383,26 +452,16 @@ const requestHandler = async (req, res) => {
     // Liveness — always 200 while the process is up.
     if (path === '/health') return sendText(res, 200, 'ok');
 
-    // Readiness — 200 only when the server can actually serve requests.
+    // Readiness — 200 only when the server can actually serve requests
+    // (keys usable, database connected, schema + pgvector + audit table present).
     if (path === '/ready') {
-      let ready = publicKey !== null;
-      const detail = { publicKey: publicKey !== null, database: false, schema: false };
-      if (config.databaseUrl) {
-        try {
-          const r = await adapter.check();
-          detail.database = r.connected;
-          detail.schema = r.schemaReady;
-          ready = ready && r.connected && r.schemaReady;
-        } catch {
-          ready = false;
-        }
-      }
-      return sendJson(res, ready ? 200 : 503, { ready, ...detail });
+      const r = await readiness();
+      return sendJson(res, r.ready ? 200 : 503, { ready: r.ready, ...r.components });
     }
 
     // MCP over Streamable HTTP — harness-agnostic memory recall/ingest.
     if (config.mcpHttpEnabled && path === config.mcpHttpPath) {
-      return handleMcp(req, res, requestId);
+      return await handleMcp(req, res, requestId);
     }
 
     // Built-in configuration UI (optional; disable in hardened deployments).
@@ -417,7 +476,7 @@ const requestHandler = async (req, res) => {
         port: config.port,
         trustDomain: config.trustDomain || null,
         publicKey: { configured: Boolean(config.publicKeyPem), valid: publicKey !== null },
-        privateKey: { configured: Boolean(config.privateKeyPem) },
+        privateKey: { configured: Boolean(config.privateKeyPem), valid: privateKeyValid, matchesPublicKey: keypairMatch },
         database: { configured: Boolean(config.databaseUrl), connected: false, schemaReady: false },
         rag: { ready: false },
         audit: { ready: false },
@@ -440,29 +499,21 @@ const requestHandler = async (req, res) => {
           }),
         },
       };
-      if (config.databaseUrl) {
+      const r = await readiness();
+      status.database.connected = r.components.database;
+      status.database.schemaReady = r.components.schema;
+      status.rag.ready = r.components.rag;
+      status.audit.ready = r.components.audit;
+      if (r.error) status.database.error = r.error;
+      if (r.components.database) {
         try {
-          const r = await adapter.check();
-          status.database.connected = r.connected;
-          status.database.schemaReady = r.schemaReady;
-          status.rag.ready = r.ragReady;
-          status.audit.ready = r.auditReady;
-          try {
-            status.consolidation.pendingReviews = await adapter.pendingReviewCount(config.trustDomain || null);
-          } catch {
-            /* review table may not exist yet */
-          }
-        } catch (e) {
-          status.database.error = e.message;
+          status.consolidation.pendingReviews = await adapter.pendingReviewCount(config.trustDomain || null);
+        } catch {
+          /* review table may not exist yet */
         }
       }
-      status.ready =
-        status.publicKey.valid &&
-        status.privateKey.configured &&
-        status.database.connected &&
-        status.database.schemaReady &&
-        status.rag.ready &&
-        status.audit.ready;
+      // The same predicate /ready answers with, so the two never disagree.
+      status.ready = r.ready;
 
       // The full status is useful recon (trust domain, source repo slugs, ingest
       // state). Unless STATUS_PUBLIC is set, only a caller holding a read
@@ -482,6 +533,7 @@ const requestHandler = async (req, res) => {
         ready: status.ready,
         components: {
           publicKey: status.publicKey.valid,
+          privateKey: signingReady,
           database: status.database.connected,
           schema: status.database.schemaReady,
           rag: status.rag.ready,
@@ -602,7 +654,7 @@ const requestHandler = async (req, res) => {
       }
       let input;
       try {
-        input = validateTraceInput(body);
+        input = validateTraceInput(body, config);
       } catch (e) {
         return sendJson(res, 400, { error: e.message });
       }
@@ -651,7 +703,7 @@ const requestHandler = async (req, res) => {
       if (rateLimited(req, res, requestId)) return;
       const q = parsed.query.q;
       const domain = parsed.query.domain || config.trustDomain;
-      const k = Math.min(Number(parsed.query.k) || 5, config.searchKMax);
+      const k = clampInt(parsed.query.k, 5, 1, config.searchKMax);
       if (!q) return sendJson(res, 400, { error: 'Missing query parameter q' });
       let claims;
       try {
@@ -702,9 +754,9 @@ const requestHandler = async (req, res) => {
         const payload = await composeWake(adapter, {
           trustDomain: domain,
           task,
-          recent: body.recent != null ? Math.min(Number(body.recent), config.searchKMax) : wakeDefaults.recent,
-          identity: body.identity != null ? Math.min(Number(body.identity), config.searchKMax) : wakeDefaults.identity,
-          relevant: body.relevant != null ? Math.min(Number(body.relevant), config.searchKMax) : wakeDefaults.relevant,
+          recent: clampInt(body.recent ?? parsed.query.recent, wakeDefaults.recent, 0, config.searchKMax),
+          identity: clampInt(body.identity ?? parsed.query.identity, wakeDefaults.identity, 0, config.searchKMax),
+          relevant: clampInt(body.relevant ?? parsed.query.relevant, wakeDefaults.relevant, 0, config.searchKMax),
           recallWeights: weightsFromConfig(config),
         });
         audit.record({ actor: claims.sub, action: 'wake', trustDomain: domain, result: 'allow', requestId, detail: { task: task ? String(task).slice(0, 80) : null, ...payload.counts, openReviews: payload.openReviews } });
@@ -730,7 +782,7 @@ const requestHandler = async (req, res) => {
       try {
         decisionUri = sanitizeUri(body.decisionUri);
         // Flat contract: { decisionUri, status, score?, evidence? } (matches the MCP tool).
-        outcome = validateOutcome({ status: body.status, score: body.score, evidence: body.evidence });
+        outcome = validateOutcome({ status: body.status, score: body.score, evidence: body.evidence }, config);
       } catch (e) {
         return sendJson(res, 400, { error: e.message });
       }
@@ -860,6 +912,12 @@ const requestHandler = async (req, res) => {
       if (!['merge', 'keep_separate', 'reject'].includes(resolution)) {
         return sendJson(res, 400, { error: 'resolution must be merge | keep_separate | reject' });
       }
+      // A token is required before the review is even looked up, so review ids
+      // cannot be probed anonymously; the domain check follows the lookup.
+      if (!bearerToken(req)) {
+        audit.record({ action: 'review_resolve', result: 'deny', requestId, detail: { reason: 'Missing token' } });
+        return denyAuth(res, new Error('Missing token'));
+      }
       let review;
       try {
         review = await adapter.getReview(body.reviewId);
@@ -911,7 +969,7 @@ const requestHandler = async (req, res) => {
           trustDomain,
           kind: body.kind ?? 'trace',
           since: body.since ?? null,
-          limit: body.limit,
+          limit: clampInt(body.limit, undefined, 1, config.distillMaxExamples),
           format: body.format,
           baseModel: body.baseModel,
           suffix: body.suffix,
@@ -974,7 +1032,7 @@ const requestHandler = async (req, res) => {
           privateKeyPem: config.privateKeyPem,
           dryRun: body.dryRun === true,
           steps: Array.isArray(body.steps) && body.steps.length ? body.steps : undefined,
-          limit: body.limit,
+          limit: clampInt(body.limit, undefined, 1, 100000),
         });
         audit.record({
           actor: claims.sub,
@@ -1139,22 +1197,43 @@ if (config.sources.length && config.ingestSchedulerEnabled) {
   });
 }
 
+// MCP session housekeeping (see sweepMcpSessions).
+const mcpSweepTimer = setInterval(() => sweepMcpSessions(), 60_000);
+mcpSweepTimer.unref();
+
 // ---------- lifecycle ----------
 
 let shuttingDown = false;
-function shutdown(signal) {
+async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info('shutdown_start', { signal });
   if (ingestTimer) clearInterval(ingestTimer);
-  server.close(() => {
-    adapter.close().finally(() => {
-      logger.info('shutdown_complete', {});
-      process.exit(0);
-    });
+  clearInterval(mcpSweepTimer);
+  // Never hang forever on lingering work.
+  setTimeout(() => {
+    logger.warn('shutdown_forced', {});
+    process.exit(1);
+  }, 10000).unref();
+
+  // Every connected harness holds an SSE stream open; server.close() would
+  // wait on those forever. Close the transports first so the listener drains.
+  await Promise.allSettled([...mcpSessions.keys()].map((sid) => closeMcpSession(sid, 'shutdown')));
+  // Let an in-flight ingest run finish (bounded) before the pool goes away.
+  const deadline = Date.now() + 8000;
+  while (ingestBusy && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+
+  await new Promise((resolve) => {
+    server.close(() => resolve());
+    if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
+    // Anything still open after a short grace is cut so the callback fires.
+    setTimeout(() => {
+      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+    }, 2000).unref();
   });
-  // Don't hang forever on lingering connections.
-  setTimeout(() => process.exit(1), 10000).unref();
+  await adapter.close().catch(() => {});
+  logger.info('shutdown_complete', {});
+  process.exit(0);
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));

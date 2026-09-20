@@ -11,6 +11,13 @@
 //   confidence/importance  salience for the produced memories
 import type { CollectContext, CollectResult } from './index.js';
 import type { IngestItem } from '../extract.js';
+import { redactUrlCredentials } from './git.js';
+
+// Error text reaches logs, audit rows, /api/status and the /ingest response;
+// a source URL may carry credentials or API keys in its userinfo or query.
+function safeUrl(u: any): string {
+  return redactUrlCredentials(String(u)).replace(/[?#].*$/, '');
+}
 
 function getPath(obj: any, dotted: string): any {
   return dotted.split('.').reduce((o, k) => (o == null ? o : o[k]), obj);
@@ -25,8 +32,13 @@ export async function collectHttp(source: any, _config: any, ctx: CollectContext
   const headers: Record<string, string> = { accept: 'application/json', ...(source.headers || {}) };
   if (source.tokenEnv && process.env[source.tokenEnv]) headers['authorization'] = `Bearer ${process.env[source.tokenEnv]}`;
 
-  const res = await fetch(source.url, { headers });
-  if (!res.ok) throw new Error(`source ${source.id}: HTTP ${res.status} from ${source.url}`);
+  let res: Response;
+  try {
+    res = await fetch(source.url, { headers });
+  } catch (e: any) {
+    throw new Error(`source ${source.id}: request to ${safeUrl(source.url)} failed: ${redactUrlCredentials(e?.message || String(e))}`);
+  }
+  if (!res.ok) throw new Error(`source ${source.id}: HTTP ${res.status} from ${safeUrl(source.url)}`);
   const data = await res.json();
   const arr = source.itemsPath ? getPath(data, source.itemsPath) : data;
   if (!Array.isArray(arr)) {

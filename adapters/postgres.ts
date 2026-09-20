@@ -326,8 +326,9 @@ export class PostgresAdapter {
     const simExpr = `(1 - (embedding <=> $1::vector))`;
     // Neutral (0) when no outcome is known, so undecided memories aren't penalized.
     const outExpr = `COALESCE(outcome_score, CASE outcome_status WHEN 'success' THEN 1 WHEN 'failure' THEN -1 WHEN 'mixed' THEN 0 ELSE 0 END, 0)`;
-    // Age is clamped at zero so a future-dated row cannot inflate its own score.
-    const recExpr = `EXP(- GREATEST(0, EXTRACT(EPOCH FROM (now() - created_at))) / $${pHalf})`;
+    // A true half-life: the term is 0.5 at RECALL_HALF_LIFE_DAYS. Age is
+    // clamped at zero so a future-dated row cannot inflate its own score.
+    const recExpr = `EXP(- LN(2) * GREATEST(0, EXTRACT(EPOCH FROM (now() - created_at))) / $${pHalf})`;
     // Bounded reinforcement bonus in [0,1); recurring memories surface higher.
     const reinfExpr = `(1 - EXP(- reinforcement_count::float / 3))`;
     // Slight additive boost for human-pinned memories (not an override).

@@ -99,7 +99,7 @@ export class FireworksProvider implements FineTuneProvider {
   }
 
   async status(jobId: string): Promise<JobResult> {
-    const res = await fetch(`${this.base}/supervisedFineTuningJobs/${jobId}`, {
+    const res = await fetch(`${this.base}/supervisedFineTuningJobs/${encodeURIComponent(jobId)}`, {
       headers: this.headers(false),
     });
     const job = await ensureOk(res, 'get job');

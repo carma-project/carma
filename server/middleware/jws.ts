@@ -6,10 +6,16 @@ import { CompactSign, compactVerify, importPKCS8, importSPKI } from 'jose';
 
 // Deterministic JSON with recursively sorted object keys, so the signature is
 // stable across transports that do not preserve key order (e.g. Postgres JSONB).
+// Follows JSON.stringify's treatment of undefined (omitted from objects, null in
+// arrays) so the canonical form survives a JSON/JSONB round trip and a signature
+// made in-process still verifies against the stored envelope.
 function stableStringify(value: any): string {
+  if (value === undefined || typeof value === 'function') return 'null';
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
-  const keys = Object.keys(value).sort();
+  const keys = Object.keys(value)
+    .filter((k) => value[k] !== undefined && typeof value[k] !== 'function')
+    .sort();
   return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
 }
 

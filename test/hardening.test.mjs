@@ -14,9 +14,12 @@ test('parseConfig: defaults, warnings, and SSL mapping', () => {
   assert.deepEqual(parseConfig({ DATABASE_SSL: 'require' }).dbSslConfig, { rejectUnauthorized: false });
   assert.deepEqual(parseConfig({ DATABASE_SSL: 'verify' }).dbSslConfig, { rejectUnauthorized: true });
 
+  // An unrecognised mode fails closed to TLS — never a silent plaintext downgrade.
   const bogus = parseConfig({ DATABASE_SSL: 'bogus' });
-  assert.equal(bogus.dbSslConfig, false);
+  assert.deepEqual(bogus.dbSslConfig, { rejectUnauthorized: false });
   assert.ok(bogus.warnings.some((w) => w.includes('DATABASE_SSL')));
+  assert.ok(bogus.fatal.includes('DATABASE_SSL'));
+  assert.deepEqual(parseConfig({ DATABASE_SSL: ' require ' }).dbSslConfig, { rejectUnauthorized: false });
 
   const strict = parseConfig({ TOKEN_MAX_AGE_WRITE: '120', RATE_LIMIT_RPS: '5' });
   assert.equal(strict.tokenMaxAgeWrite, 120);

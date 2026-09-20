@@ -3,16 +3,68 @@
 // parsed from process.env.
 import fs from 'node:fs';
 import { parseSources, summarizeSource } from './ingest/sources.js';
+import { normalizeDbSslMode, dbSslConfig } from './dbssl.js';
+
+// A blank variable ("KEY=" in an .env, a compose `${VAR:-}` interpolation, an
+// empty Railway value) means unset, never zero: a zero RATE_LIMIT_BURST would
+// 429 every request and a zero PORT would listen on a random port.
+function isBlank(value) {
+  return value == null || String(value).trim() === '';
+}
 
 function toInt(value, def) {
+  if (isBlank(value)) return def;
   const n = Number(value);
   return Number.isFinite(n) ? Math.trunc(n) : def;
 }
 
 function toFloat(value, def) {
+  if (isBlank(value)) return def;
   const n = Number(value);
   return Number.isFinite(n) ? n : def;
 }
+
+// Accepted range per numeric variable: cfg key -> [env name, min, max, default].
+// A value outside its range (or unparseable) falls back to the default with a
+// warning, and fails boot under STRICT_BOOT.
+const NUMERIC_BOUNDS = {
+  port: ['PORT', 1, 65535, 7100],
+  dbPoolMax: ['DB_POOL_MAX', 1, 1000, 10],
+  dbIdleTimeoutMs: ['DB_IDLE_TIMEOUT_MS', 0, 2147483647, 30000],
+  dbConnectTimeoutMs: ['DB_CONNECT_TIMEOUT_MS', 1, 2147483647, 5000],
+  embedDim: ['EMBED_DIM', 1, 16000, 256],
+  tokenMaxAgeRead: ['TOKEN_MAX_AGE_READ', 1, 31536000, 3600],
+  tokenMaxAgeWrite: ['TOKEN_MAX_AGE_WRITE', 1, 31536000, 900],
+  rateLimitRps: ['RATE_LIMIT_RPS', 1, 1000000, 20],
+  rateLimitBurst: ['RATE_LIMIT_BURST', 1, 1000000, 40],
+  bodyLimitBytes: ['BODY_LIMIT_BYTES', 1024, 1000000000, 1000000],
+  contentMaxLength: ['CONTENT_MAX_LENGTH', 1, 100000000, 100000],
+  boundContextMax: ['BOUND_CONTEXT_MAX', 1, 100000, 256],
+  searchKMax: ['SEARCH_K_MAX', 1, 10000, 50],
+  recallWSim: ['RECALL_W_SIM', 0, 100, 1.0],
+  recallWOutcome: ['RECALL_W_OUTCOME', 0, 100, 0.4],
+  recallWRecency: ['RECALL_W_RECENCY', 0, 100, 0.15],
+  recallHalfLifeDays: ['RECALL_HALF_LIFE_DAYS', 0.001, 36500, 30],
+  recallPinnedBoost: ['RECALL_PINNED_BOOST', 0, 100, 0.1],
+  recallWReinforce: ['RECALL_W_REINFORCE', 0, 100, 0.05],
+  consolidateSimThreshold: ['CONSOLIDATE_SIM_THRESHOLD', 0, 1, 0.92],
+  tierConsolidateMinConfidence: ['TIER_CONSOLIDATE_MIN_CONFIDENCE', 0, 1, 0.8],
+  tierConsolidateMinImportance: ['TIER_CONSOLIDATE_MIN_IMPORTANCE', 0, 1, 0.7],
+  reinforcePromoteAt: ['REINFORCE_PROMOTE_AT', 1, 1000000, 3],
+  dreamDecayDays: ['DREAM_DECAY_DAYS', 0, 36500, 30],
+  dreamMinReinforceKeep: ['DREAM_MIN_REINFORCE_KEEP', 0, 1000000, 1],
+  dreamSimThreshold: ['DREAM_SIM_THRESHOLD', 0, 1, 0.92],
+  dreamMinClusterSize: ['DREAM_MIN_CLUSTER_SIZE', 1, 1000000, 3],
+  dreamMaxReviews: ['DREAM_MAX_REVIEWS', 0, 1000000, 100],
+  dreamMaxAbstractions: ['DREAM_MAX_ABSTRACTIONS', 0, 1000000, 50],
+  distillMaxExamples: ['DISTILL_MAX_EXAMPLES', 1, 100000000, 50000],
+  wakeRecent: ['WAKE_RECENT', 0, 1000, 5],
+  wakeIdentity: ['WAKE_IDENTITY', 0, 1000, 8],
+  wakeRelevant: ['WAKE_RELEVANT', 0, 1000, 5],
+  ingestSchedulerTickMs: ['INGEST_SCHEDULER_TICK_MS', 1000, 2147483647, 60000],
+  mcpSessionIdleMs: ['MCP_SESSION_IDLE_MS', 1000, 2147483647, 1800000],
+  mcpSessionMax: ['MCP_SESSION_MAX', 1, 1000000, 1000],
+};
 
 function toBool(value, def = false) {
   if (value === undefined || value === '') return def;
@@ -85,8 +137,9 @@ export function parseConfig(env = {}) {
     jwtIssuer: env.JWT_ISSUER || '',
     jwtAudience: env.JWT_AUDIENCE || '',
     databaseUrl: env.DATABASE_URL || '',
-    // 'disable' (default) | 'require' (encrypt, don't verify) | 'verify' (verify CA)
-    databaseSsl: (env.DATABASE_SSL || 'disable').toLowerCase(),
+    // 'disable' (default) | 'require' (encrypt, don't verify) | 'verify' (verify CA).
+    // Shared with adapters/migrate.mjs; an unknown value fails closed to 'require'.
+    databaseSsl: normalizeDbSslMode(env.DATABASE_SSL).mode,
     dbPoolMax: toInt(env.DB_POOL_MAX, 10),
     dbIdleTimeoutMs: toInt(env.DB_IDLE_TIMEOUT_MS, 30000),
     dbConnectTimeoutMs: toInt(env.DB_CONNECT_TIMEOUT_MS, 5000),
@@ -169,6 +222,10 @@ export function parseConfig(env = {}) {
     // available for local harnesses via `npm run mcp`.
     mcpHttpEnabled: toBool(env.MCP_HTTP_ENABLED, true),
     mcpHttpPath: env.MCP_HTTP_PATH || '/mcp',
+    // HTTP MCP sessions are closed after this much idle time (and at token
+    // expiry regardless); the session table is capped at mcpSessionMax.
+    mcpSessionIdleMs: toInt(env.MCP_SESSION_IDLE_MS, 1800000),
+    mcpSessionMax: toInt(env.MCP_SESSION_MAX, 1000),
     // Exposure hardening. `/api/status` reveals operational detail (trust domain,
     // configured sources incl. repo slugs, ingest state) that is useful recon for
     // an anonymous caller. By default the full detail requires a read capability;
@@ -240,16 +297,32 @@ export function parseConfig(env = {}) {
   };
 
   cfg.warnings = [];
-  if (!cfg.publicKeyPem) cfg.warnings.push('PUBLIC_KEY not set — authenticated endpoints will 403.');
+  // Variables whose value is invalid (not merely missing). STRICT_BOOT refuses
+  // to start on any of these instead of running on a silently substituted default.
+  cfg.fatal = [];
+  for (const [key, [envName, min, max, def]] of Object.entries(NUMERIC_BOUNDS)) {
+    if (isBlank(env[envName])) continue;
+    const v = cfg[key];
+    if (!Number.isFinite(Number(env[envName])) || v < min || v > max) {
+      cfg.warnings.push(`${envName}="${env[envName]}" invalid (expected a number in [${min}, ${max}]); using ${def}.`);
+      cfg.fatal.push(envName);
+      cfg[key] = def;
+    }
+  }
+  if (!cfg.publicKeyPem) cfg.warnings.push('PUBLIC_KEY not set — authenticated endpoints will 401.');
   if (!cfg.privateKeyPem) cfg.warnings.push('PRIVATE_KEY not set — trace ingest/signing will fail.');
   if (!cfg.databaseUrl) cfg.warnings.push('DATABASE_URL not set — resolve/ingest/search unavailable.');
   if (!cfg.trustDomain) cfg.warnings.push('TRUST_DOMAIN not set — ingest/search require an explicit domain.');
-  if (!['disable', 'require', 'verify'].includes(cfg.databaseSsl)) {
-    cfg.warnings.push(`DATABASE_SSL="${cfg.databaseSsl}" invalid; falling back to "disable".`);
-    cfg.databaseSsl = 'disable';
+  const sslMode = normalizeDbSslMode(env.DATABASE_SSL);
+  if (!sslMode.valid) {
+    cfg.warnings.push(`DATABASE_SSL="${sslMode.raw}" invalid (disable | require | verify); failing closed to "require".`);
+    cfg.fatal.push('DATABASE_SSL');
   }
   if (cfg.embeddingProvider !== 'local') {
     cfg.warnings.push(`EMBEDDING_PROVIDER="${cfg.embeddingProvider}" — only "local" is implemented.`);
+  }
+  if (cfg.embedDim !== 256) {
+    cfg.warnings.push(`EMBED_DIM=${cfg.embedDim} but the shipped migrations create vector(256) — alter the column and re-embed before changing it.`);
   }
   if (cfg.finetuneProvider === 'fireworks' && (!cfg.fireworksApiKey || !cfg.fireworksAccountId)) {
     cfg.warnings.push('FINETUNE_PROVIDER=fireworks but FIREWORKS_API_KEY/FIREWORKS_ACCOUNT_ID are not both set.');
@@ -276,7 +349,7 @@ export function parseConfig(env = {}) {
       cfg.warnings.push('MTLS_MODE=direct but TLS_CERT/TLS_KEY are not both set — CARMA cannot terminate TLS to verify client certs; POST /capability will 401.');
     }
     if (cfg.mtlsMode === 'direct' && !cfg.capabilityClientCaPem) {
-      cfg.warnings.push('MTLS_MODE=direct but CAPABILITY_CLIENT_CA is not set — no client certificates can be verified; POST /capability will 401.');
+      cfg.warnings.push('MTLS_MODE=direct but CAPABILITY_CLIENT_CA is not set — the listener stays plain HTTP (no fallback to public roots) and POST /capability will 401.');
     }
     if (cfg.mtlsMode === 'proxy' && !cfg.mtlsProxySecret) {
       cfg.warnings.push('MTLS_MODE=proxy but CAPABILITY_PROXY_SECRET is not set — forwarded client identity cannot be trusted; POST /capability will 401.');
@@ -320,11 +393,8 @@ export function parseConfig(env = {}) {
     Boolean(cfg.tlsKeyPem) &&
     Boolean(cfg.capabilityClientCaPem);
 
-  // Node pg SSL config, or false to disable.
-  cfg.dbSslConfig =
-    cfg.databaseSsl === 'disable'
-      ? false
-      : { rejectUnauthorized: cfg.databaseSsl === 'verify' };
+  // Node pg SSL config, or false to disable (same mapping migrate.mjs uses).
+  cfg.dbSslConfig = dbSslConfig(cfg.databaseSsl);
 
   return cfg;
 }

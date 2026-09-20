@@ -19,6 +19,9 @@ export async function issueCapability(grant: CapabilityGrant, privateKeyPem: str
   const key = await importPKCS8(privateKeyPem, 'EdDSA');
   const issuer = grant.issuer ?? process.env.JWT_ISSUER;
   const audience = grant.audience ?? process.env.JWT_AUDIENCE;
+  // A bare number is seconds; anything else is a time span ('15m', '1h').
+  const ttl = grant.ttl ?? '1h';
+  const expiresAt = /^\d+$/.test(String(ttl)) ? Math.floor(Date.now() / 1000) + Number(ttl) : String(ttl);
   let jwt = new SignJWT({
     jsonam: {
       domains: grant.domains,
@@ -29,7 +32,7 @@ export async function issueCapability(grant: CapabilityGrant, privateKeyPem: str
     .setProtectedHeader({ alg: 'EdDSA', kid: 'carma-key' })
     .setSubject(grant.subject ?? 'carma')
     .setIssuedAt()
-    .setExpirationTime(grant.ttl ?? '1h');
+    .setExpirationTime(expiresAt);
   if (issuer) jwt = jwt.setIssuer(issuer);
   if (audience) jwt = jwt.setAudience(audience);
   return await jwt.sign(key);
