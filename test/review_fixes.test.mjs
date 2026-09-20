@@ -291,7 +291,7 @@ function req(method, p, token, body, extraHeaders = {}, port = PORT) {
         try {
           json = JSON.parse(b);
         } catch {}
-        resolve({ status: res.statusCode, json, text: b });
+        resolve({ status: res.statusCode, json, text: b, headers: res.headers });
       });
     });
     r.on('error', reject);
@@ -444,6 +444,41 @@ test('HTTP: a real MCP client initializes over the pre-parsed body; DELETE ends 
     assert.equal(after.status, 404);
   } finally {
     await client.close().catch(() => {});
+    child.kill('SIGTERM');
+  }
+});
+
+test('HTTP: BASIC_AUTH_* gates everything without a bearer token; probes and token traffic pass', async () => {
+  const port = PORT + 3;
+  const child = spawnServer(port, { BASIC_AUTH_USER: 'preview', BASIC_AUTH_PASSWORD: 's3cret pass' });
+  const creds = (u, p) => ({ Authorization: 'Basic ' + Buffer.from(`${u}:${p}`).toString('base64') });
+  try {
+    await waitHealth(port);
+    const anon = await req('GET', '/', null, null, {}, port);
+    assert.equal(anon.status, 401);
+    assert.match(anon.headers['www-authenticate'], /^Basic /);
+    const wrong = await req('GET', '/', null, null, creds('preview', 'nope'), port);
+    assert.equal(wrong.status, 401);
+    const wrongUser = await req('GET', '/', null, null, creds('admin', 's3cret pass'), port);
+    assert.equal(wrongUser.status, 401);
+    const ok = await req('GET', '/', null, null, creds('preview', 's3cret pass'), port);
+    assert.equal(ok.status, 200);
+    assert.match(ok.text, /</);
+    const status = await req('GET', '/api/status', null, null, creds('preview', 's3cret pass'), port);
+    assert.equal(status.status, 200);
+    assert.equal(status.json.ready, false);
+
+    // Probes stay open for orchestrators.
+    assert.equal((await req('GET', '/health', null, null, {}, port)).status, 200);
+    assert.equal((await req('GET', '/ready', null, null, {}, port)).status, 503);
+
+    // Bearer traffic never sees the Basic challenge: it reaches the capability checks.
+    const token = await issueCapability({ domains: ['trust://acme'], actions: ['read', 'write'], subject: 't' }, pkcs8);
+    const api = await req('GET', '/search?q=x&domain=other', token, null, {}, port);
+    assert.equal(api.status, 403);
+    const mcp = await req('POST', '/mcp', token, initialize(), MCP_ACCEPT, port);
+    assert.equal(mcp.status, 200);
+  } finally {
     child.kill('SIGTERM');
   }
 });

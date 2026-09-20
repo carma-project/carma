@@ -2,7 +2,7 @@ import http from 'http';
 import https from 'https';
 import url from 'url';
 import { readFileSync } from 'fs';
-import { randomUUID, createHash } from 'crypto';
+import { randomUUID, createHash, timingSafeEqual } from 'crypto';
 import { importSPKI, importPKCS8, CompactSign, compactVerify } from 'jose';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -234,6 +234,41 @@ function rateLimited(req, res, requestId) {
   return true;
 }
 
+// ---------- optional HTTP Basic login ----------
+// With BASIC_AUTH_USER/BASIC_AUTH_PASSWORD set, every request that does not
+// carry a bearer capability token must present those credentials: the built-in
+// UI, /api/status, and any anonymous probe of the API. Requests with a bearer
+// token go through the capability checks as usual, so MCP harnesses and API
+// clients are unaffected. Liveness/readiness stay open for orchestrators.
+const BASIC_LOGIN_EXEMPT = new Set(['/health', '/ready']);
+
+function basicCredentialsOk(req) {
+  const m = /^Basic\s+([A-Za-z0-9+/=]+)$/i.exec(req.headers.authorization || '');
+  if (!m) return false;
+  const decoded = Buffer.from(m[1], 'base64').toString('utf8');
+  const idx = decoded.indexOf(':');
+  if (idx < 0) return false;
+  // Compare digests so timing depends on neither length nor content, and
+  // check both halves so a correct username alone is not observable.
+  const digest = (s) => createHash('sha256').update(String(s)).digest();
+  const userOk = timingSafeEqual(digest(decoded.slice(0, idx)), digest(config.basicAuthUser));
+  const passOk = timingSafeEqual(digest(decoded.slice(idx + 1)), digest(config.basicAuthPassword));
+  return userOk && passOk;
+}
+
+// Returns true when it has answered the request (401 challenge or 429).
+function basicLoginRequired(req, res, path, requestId) {
+  if (!config.basicAuthEnabled || BASIC_LOGIN_EXEMPT.has(path)) return false;
+  if (bearerToken(req)) return false;
+  if (basicCredentialsOk(req)) return false;
+  // Missing or wrong credentials spend the client's rate-limit budget, so a
+  // public domain cannot be brute-forced faster than the API can be probed.
+  if (rateLimited(req, res, requestId)) return true;
+  res.setHeader('WWW-Authenticate', 'Basic realm="carma", charset="UTF-8"');
+  sendJson(res, 401, { error: 'Unauthorized' });
+  return true;
+}
+
 // One readiness predicate for /ready and /api/status: a verification key, a
 // usable signing key, and a connected database with the schema, pgvector and
 // the audit table in place. Anything less cannot serve writes or recall, so it
@@ -449,6 +484,8 @@ const requestHandler = async (req, res) => {
   });
 
   try {
+    if (basicLoginRequired(req, res, path, requestId)) return;
+
     // Liveness — always 200 while the process is up.
     if (path === '/health') return sendText(res, 200, 'ok');
 

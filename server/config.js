@@ -236,6 +236,13 @@ export function parseConfig(env = {}) {
     // Serve the built-in configuration UI at `/` and `/ui`. Disable in hardened
     // deployments where even the fingerprint/landing page should not be served.
     uiEnabled: toBool(env.UI_ENABLED, true),
+    // Optional HTTP Basic login for every request that does not carry a bearer
+    // capability token (the built-in UI, /api/status, anonymous probes of the
+    // API). Lets a preview or internal deployment sit on a public domain
+    // without handing out capability tokens. Both must be set to enable it;
+    // /health and /ready stay open for orchestrator probes.
+    basicAuthUser: env.BASIC_AUTH_USER || '',
+    basicAuthPassword: env.BASIC_AUTH_PASSWORD || '',
     // Wake (session-start priming): the recall counterpart to ingest/dream.
     // Layer sizes for the brief composed at the start of a session (POST /wake,
     // MCP `wake` tool, and the memory://<domain>/wake resource).
@@ -323,6 +330,11 @@ export function parseConfig(env = {}) {
   }
   if (cfg.embedDim !== 256) {
     cfg.warnings.push(`EMBED_DIM=${cfg.embedDim} but the shipped migrations create vector(256) — alter the column and re-embed before changing it.`);
+  }
+  cfg.basicAuthEnabled = Boolean(cfg.basicAuthUser && cfg.basicAuthPassword);
+  if (Boolean(cfg.basicAuthUser) !== Boolean(cfg.basicAuthPassword)) {
+    cfg.warnings.push('BASIC_AUTH_USER and BASIC_AUTH_PASSWORD must both be set — basic login stays disabled.');
+    cfg.fatal.push(cfg.basicAuthUser ? 'BASIC_AUTH_PASSWORD' : 'BASIC_AUTH_USER');
   }
   if (cfg.finetuneProvider === 'fireworks' && (!cfg.fireworksApiKey || !cfg.fireworksAccountId)) {
     cfg.warnings.push('FINETUNE_PROVIDER=fireworks but FIREWORKS_API_KEY/FIREWORKS_ACCOUNT_ID are not both set.');
@@ -412,7 +424,7 @@ export function redactedSummary(cfg) {
     embedDim: cfg.embedDim,
     finetuneProvider: cfg.finetuneProvider,
     mcpHttp: cfg.mcpHttpEnabled ? cfg.mcpHttpPath : false,
-    exposure: { statusPublic: cfg.statusPublic, ui: cfg.uiEnabled },
+    exposure: { statusPublic: cfg.statusPublic, ui: cfg.uiEnabled, basicAuth: cfg.basicAuthEnabled },
     memoryModel: cfg.memoryModelProvider,
     wake: { recent: cfg.wakeRecent, identity: cfg.wakeIdentity, relevant: cfg.wakeRelevant, mcpInstructions: cfg.mcpWakeInstructions },
     capability: cfg.capabilityEndpointEnabled

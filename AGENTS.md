@@ -144,6 +144,11 @@ Native ingestion (sources CARMA pulls itself):
   ingest state) requires a read capability. Set `true` to expose the full detail anonymously (local/dev).
 - `UI_ENABLED` (default `true`) — serve the built-in config UI at `/` and `/ui`; disable in hardened
   deployments. See `docs/EXPOSURE.md` for the no-public-listener (Zero-Trust tunnel) topology.
+- `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` — optional HTTP Basic login for every request that does
+  not carry a bearer capability token (the built-in UI, `/api/status`, anonymous probes of the API).
+  Both must be set to enable it; `/health` and `/ready` stay open for probes, and failed attempts
+  spend the client's rate-limit budget. Requests with a bearer token are unaffected (MCP harnesses,
+  API clients). Use it to put a preview or internal deployment on a public domain.
 - `WAKE_RECENT` (`5`) / `WAKE_IDENTITY` (`8`) / `WAKE_RELEVANT` (`5`) — layer sizes for the
   session-start "wake" brief (`POST /wake`, MCP `wake` tool, `memory://<domain>/wake` resource):
   how many recent decisions, identity/self memories, and (when a task is given) relevant precedents.
