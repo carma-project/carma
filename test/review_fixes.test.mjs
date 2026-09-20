@@ -464,9 +464,12 @@ test('HTTP: BASIC_AUTH_* gates everything without a bearer token; probes and tok
     const ok = await req('GET', '/', null, null, creds('preview', 's3cret pass'), port);
     assert.equal(ok.status, 200);
     assert.match(ok.text, /</);
+    // The operator login unlocks the full status detail the UI renders.
     const status = await req('GET', '/api/status', null, null, creds('preview', 's3cret pass'), port);
     assert.equal(status.status, 200);
     assert.equal(status.json.ready, false);
+    assert.equal(status.json.trustDomain, 'acme');
+    assert.equal(status.json.publicKey.valid, true);
 
     // Probes stay open for orchestrators.
     assert.equal((await req('GET', '/health', null, null, {}, port)).status, 200);

@@ -556,8 +556,10 @@ const requestHandler = async (req, res) => {
       // state). Unless STATUS_PUBLIC is set, only a caller holding a read
       // capability sees the detail; anonymous callers get coarse readiness
       // booleans — enough for an uptime probe, nothing to enumerate.
-      let authed = false;
-      if (!config.statusPublic) {
+      // The operator login (BASIC_AUTH_*) also unlocks the detail: whoever
+      // holds those credentials is the person the built-in UI exists for.
+      let authed = config.basicAuthEnabled && basicCredentialsOk(req);
+      if (!config.statusPublic && !authed) {
         try {
           await authorize(req, `memory://${config.trustDomain || 'status'}/status`, 'read');
           authed = true;
